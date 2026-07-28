@@ -1954,6 +1954,7 @@ export const ja = defineLocale({
     versionDetailsVersion: 'バージョン',
     versionDetailsBaseVersion: 'リリースバージョン',
     versionDetailsBranch: 'ブランチ',
+    versionDetailsNoBranchInfo: 'ブランチ情報なし',
     versionDetailsCommit: 'コミット',
     versionDetailsDirty: 'このパッケージは変更のあるソースツリーからビルドされました。',
     versionDetailsDirtyUnknown: '変更のあるソースツリーからビルドされました。最後のリリースからの変更数は不明です。',

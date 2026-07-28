@@ -44,10 +44,6 @@ let
     if distance != null && distance > 0 then "${version}+${toString distance}"
     else if dirty && distance == null then "${version}+?"
     else version;
-  # On a dirty tree, sourceInfo.ref is null (flakes can't determine the ref).
-  # Show "unknown" rather than null so the desktop doesn't fall back to its
-  # self-update default branch ("main") when the real branch is unavailable.
-  branchLabel = if branch != null then branch else "unknown";
 
   electronHeaders = pkgs.fetchurl {
     url = "https://artifacts.electronjs.org/headers/dist/v${electron.version}/node-v${electron.version}-headers.tar.gz";
@@ -166,7 +162,7 @@ let
         cp -rn apps/desktop/dist $out/
 
         cat > $out/install-stamp.json <<'EOF'
-        {"schemaVersion":2,"commit":${builtins.toJSON rev},"branch":${builtins.toJSON branchLabel},"baseVersion":"${version}","displayVersion":"${displayVersion}","distance":${builtins.toJSON distance},"dirty":${
+        {"schemaVersion":2,"commit":${builtins.toJSON rev},"branch":${builtins.toJSON branch},"baseVersion":"${version}","displayVersion":"${displayVersion}","distance":${builtins.toJSON distance},"dirty":${
           if dirty then "true" else "false"
         },"source":"nix","installMethod":"nix"}
         EOF
