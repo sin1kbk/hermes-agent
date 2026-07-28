@@ -1,18 +1,19 @@
-"""Tests for gateway.claude_bridge's `claude -p` spawn wrapper.
+"""Tests for the Claude bridge stream-json subprocess protocol.
 
-Covers JSON-output parsing, non-zero exit / unparseable-output / timeout
-error surfacing, and the resume-failure -> fresh-spawn fallback in
-``ClaudeBridge._handle_locked``. All subprocess creation is mocked — no real
-``claude`` binary is invoked.
+Every subprocess is a controllable asyncio fake.  These tests deliberately
+exercise the persistent process boundary; no test invokes a real ``claude``
+binary or network service.
 """
 
 import asyncio
 import json
+import time
+from collections import deque
 from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.claude_bridge import ClaudeBridge, _SpawnOutcome, _spawn_claude
+from gateway.claude_bridge import ClaudeBridge, _ClaudeProcess
 from gateway.config import ClaudeBridgeConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
@@ -28,23 +29,74 @@ def hermes_home(tmp_path):
         reset_hermes_home_override(token)
 
 
-class _FakeProc:
-    def __init__(self, stdout=b"", stderr=b"", returncode=0, hang=False):
-        self._stdout = stdout
-        self._stderr = stderr
-        self.returncode = returncode
-        self._hang = hang
-        self.killed = False
-        self.stdin_received = None
+class _FakeReader:
+    def __init__(self):
+        self._lines = asyncio.Queue()
+        self._eof = False
+        self.read_sizes = []
 
-    async def communicate(self, input=None):
-        self.stdin_received = input
-        if self._hang:
-            await asyncio.sleep(60)
-        return self._stdout, self._stderr
+    def feed_lines(self, lines):
+        for line in lines:
+            self._lines.put_nowait(line if isinstance(line, bytes) else line.encode("utf-8"))
+
+    def feed_eof(self):
+        if not self._eof:
+            self._eof = True
+            self._lines.put_nowait(None)
+
+    async def readline(self):
+        line = await self._lines.get()
+        return b"" if line is None else line
+
+    async def read(self, size=-1):
+        self.read_sizes.append(size)
+        line = await self._lines.get()
+        return b"" if line is None else line
+
+
+class _FakeWriter:
+    def __init__(self, process):
+        self._process = process
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(data)
+        self._process._on_input(data)
+
+    async def drain(self):
+        return None
+
+
+class _FakeProc:
+    def __init__(self, responses=(), *, eof_after_response=False, stderr_lines=()):
+        self.stdout = _FakeReader()
+        self.stderr = _FakeReader()
+        self.stdin = _FakeWriter(self)
+        self._responses = deque(responses)
+        self._eof_after_response = eof_after_response
+        self.returncode = None
+        self.killed = False
+        self.kill_count = 0
+        self.stderr.feed_lines(stderr_lines)
+        self.stderr.feed_eof()
+
+    def _on_input(self, _data):
+        if self._responses:
+            self.stdout.feed_lines(self._responses.popleft())
+            if self._eof_after_response:
+                self.stdout.feed_eof()
 
     def kill(self):
         self.killed = True
+        self.kill_count += 1
+        self.returncode = -9
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+
+    async def wait(self):
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
 
 
 def _event(text: str) -> MessageEvent:
@@ -54,203 +106,269 @@ def _event(text: str) -> MessageEvent:
     )
 
 
-async def _spawn(monkeypatch, tmp_path, fake_proc, **kwargs):
-    monkeypatch.setattr(
-        "gateway.claude_bridge.asyncio.create_subprocess_exec",
-        AsyncMock(return_value=fake_proc),
+def _result(text, session_id="sess-1", **extra):
+    return (json.dumps({"type": "result", "result": text, "session_id": session_id,
+                        "is_error": False, **extra}) + "\n").encode("utf-8")
+
+
+def _bridge(home, **overrides):
+    return ClaudeBridge(ClaudeBridgeConfig(enabled=True, working_dir=str(home), **overrides))
+
+
+@pytest.mark.asyncio
+async def test_two_turns_reuse_one_process_and_write_stream_json_to_stdin(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("first")], [_result("second")]])
+    spawn = AsyncMock(return_value=proc)
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home)
+
+    assert await bridge.handle_message(_event("one")) == "first"
+    assert await bridge.handle_message(_event("two")) == "second"
+
+    assert spawn.await_count == 1
+    sent = [json.loads(write.decode("utf-8")) for write in proc.stdin.writes]
+    assert [item["message"]["content"][0]["text"] for item in sent] == ["one", "two"]
+    args = spawn.call_args.args
+    assert args[:6] == (
+        "claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json",
     )
-    return await _spawn_claude(
-        claude_bin="claude",
-        working_dir=str(tmp_path),
-        prompt=kwargs.pop("prompt", "hi"),
-        resume_session_id=kwargs.pop("resume_session_id", None),
-        extra_args=kwargs.pop("extra_args", []),
-        timeout_seconds=kwargs.pop("timeout_seconds", 5),
-    )
+    assert "--verbose" in args
+    assert spawn.call_args.kwargs["limit"] == 10 * 1024 * 1024
+    await bridge.close()
 
 
-def test_spawn_parses_json_result(monkeypatch, tmp_path):
-    payload = {
-        "result": "hi there", "session_id": "sess-1",
-        "is_error": False, "total_cost_usd": 0.01,
-    }
-    fake = _FakeProc(stdout=json.dumps(payload).encode())
+@pytest.mark.asyncio
+async def test_non_result_and_unparseable_event_lines_are_ignored(monkeypatch, hermes_home, caplog):
+    proc = _FakeProc(responses=[[
+        b"not json\n",
+        b'{"type":"assistant","message":{"content":[]}}\n',
+        _result("usable"),
+    ]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    bridge = _bridge(hermes_home)
 
-    outcome = asyncio.run(_spawn(monkeypatch, tmp_path, fake))
-
-    assert outcome.error is None
-    assert outcome.parsed["result"] == "hi there"
-    assert outcome.parsed["session_id"] == "sess-1"
-
-
-def test_spawn_reports_nonzero_exit_with_stderr(monkeypatch, tmp_path):
-    fake = _FakeProc(stderr=b"boom", returncode=1)
-
-    outcome = asyncio.run(_spawn(monkeypatch, tmp_path, fake))
-
-    assert outcome.parsed is None
-    assert "exited 1" in outcome.error
-    assert "boom" in outcome.error
+    assert await bridge.handle_message(_event("hello")) == "usable"
+    assert any("unparseable stream-json" in record.message for record in caplog.records)
+    await bridge.close()
 
 
-def test_spawn_reports_unparseable_output(monkeypatch, tmp_path):
-    fake = _FakeProc(stdout=b"not json at all")
-
-    outcome = asyncio.run(_spawn(monkeypatch, tmp_path, fake))
-
-    assert outcome.parsed is None
-    assert "unparseable" in outcome.error
-
-
-def test_spawn_reports_non_object_json(monkeypatch, tmp_path):
-    fake = _FakeProc(stdout=b"[1, 2, 3]")
-
-    outcome = asyncio.run(_spawn(monkeypatch, tmp_path, fake))
-
-    assert outcome.parsed is None
-    assert "non-object" in outcome.error
-
-
-def test_spawn_failure_to_launch_is_reported(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_spawn_failure_is_reported(monkeypatch, hermes_home):
     monkeypatch.setattr(
         "gateway.claude_bridge.asyncio.create_subprocess_exec",
         AsyncMock(side_effect=FileNotFoundError("claude: not found")),
     )
+    bridge = _bridge(hermes_home)
 
-    outcome = asyncio.run(
-        _spawn_claude(
-            claude_bin="claude", working_dir=str(tmp_path), prompt="hi",
-            resume_session_id=None, extra_args=[], timeout_seconds=5,
-        )
-    )
+    reply = await bridge.handle_message(_event("hello"))
 
-    assert outcome.parsed is None
-    assert "failed to spawn" in outcome.error
+    assert "failed to spawn" in reply
+    await bridge.close()
 
 
-def test_spawn_times_out_and_kills_process(monkeypatch, tmp_path):
-    fake = _FakeProc(hang=True)
+@pytest.mark.asyncio
+async def test_stdout_eof_reports_stderr_tail(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[]], eof_after_response=True, stderr_lines=[b"cli failed\n"])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    bridge = _bridge(hermes_home)
 
-    outcome = asyncio.run(_spawn(monkeypatch, tmp_path, fake, timeout_seconds=0.05))
+    reply = await bridge.handle_message(_event("hello"))
 
-    assert outcome.parsed is None
-    assert outcome.timed_out is True
-    assert fake.killed is True
-
-
-def test_resume_uses_resume_flag(monkeypatch, tmp_path):
-    payload = {"result": "ok", "session_id": "sess-1", "is_error": False}
-    fake = _FakeProc(stdout=json.dumps(payload).encode())
-    exec_mock = AsyncMock(return_value=fake)
-    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", exec_mock)
-
-    asyncio.run(
-        _spawn_claude(
-            claude_bin="claude", working_dir=str(tmp_path), prompt="hi",
-            resume_session_id="sess-1", extra_args=["--foo"], timeout_seconds=5,
-        )
-    )
-
-    called_args = exec_mock.call_args.args
-    assert "--resume" in called_args
-    assert "sess-1" in called_args
-    assert "--foo" in called_args
+    assert "ended before a result" in reply
+    assert "cli failed" in reply
+    await bridge.close()
 
 
-def test_prompt_is_sent_via_stdin_not_argv(monkeypatch, tmp_path):
-    """C2: argv injection / ARG_MAX — the prompt must never appear in argv."""
-    payload = {"result": "ok", "session_id": "sess-1", "is_error": False}
-    fake = _FakeProc(stdout=json.dumps(payload).encode())
-    exec_mock = AsyncMock(return_value=fake)
-    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", exec_mock)
+@pytest.mark.asyncio
+async def test_timeout_kills_process_then_next_turn_respawns_with_resume(monkeypatch, hermes_home):
+    timed_out = _FakeProc()
+    resumed = _FakeProc(responses=[[_result("resumed", "stale-session")]])
+    spawn = AsyncMock(side_effect=[timed_out, resumed])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home, timeout_seconds=0.01)
+    bridge._sessions.set("discord:c1", "stale-session")
 
-    prompt = "-rf --dangerous a Discord message that looks like CLI flags"
-    asyncio.run(
-        _spawn_claude(
-            claude_bin="claude", working_dir=str(tmp_path), prompt=prompt,
-            resume_session_id=None, extra_args=[], timeout_seconds=5,
-        )
-    )
+    reply = await bridge.handle_message(_event("slow"))
+    assert "timed out" in reply
+    assert timed_out.killed is True
 
-    called_args = exec_mock.call_args.args
-    assert prompt not in called_args
-    assert all(prompt not in str(a) for a in called_args)
-    assert fake.stdin_received == prompt.encode("utf-8")
-
-    # `claude -p` (no positional prompt argument) reads from stdin.
-    kwargs = exec_mock.call_args.kwargs
-    assert kwargs.get("stdin") is not None
+    assert await bridge.handle_message(_event("again")) == "resumed"
+    assert spawn.await_count == 2
+    assert "--resume" in spawn.call_args_list[1].args
+    assert "stale-session" in spawn.call_args_list[1].args
+    await bridge.close()
 
 
-def test_resume_failure_falls_back_to_fresh_spawn(monkeypatch, hermes_home):
-    calls = []
+@pytest.mark.asyncio
+async def test_resume_not_found_result_retries_once_as_fresh_process(monkeypatch, hermes_home):
+    not_found = _FakeProc(responses=[[(json.dumps({
+        "type": "result", "is_error": True, "result": "missing", "session_id": "stale-session",
+        "subtype": "error_during_execution", "num_turns": 0,
+        "errors": ["No conversation found with session ID: stale-session"],
+    }) + "\n").encode()]])
+    fresh = _FakeProc(responses=[[_result("fresh reply", "new-session")]])
+    spawn = AsyncMock(side_effect=[not_found, fresh])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home)
+    bridge._sessions.set("discord:c1", "stale-session")
 
-    async def _fake_spawn(*, resume_session_id, **kwargs):
-        calls.append(resume_session_id)
-        if resume_session_id:
-            return _SpawnOutcome(error="unknown session")
-        return _SpawnOutcome(
-            parsed={"result": "fresh reply", "session_id": "new-sess", "is_error": False}
-        )
+    reply = await bridge.handle_message(_event("hello"))
 
-    monkeypatch.setattr("gateway.claude_bridge._spawn_claude", _fake_spawn)
-
-    bridge = ClaudeBridge(ClaudeBridgeConfig(enabled=True, working_dir=str(hermes_home)))
-    bridge._sessions.set("discord:c1", "stale-sess")
-
-    reply = asyncio.run(bridge.handle_message(_event("hello")))
-
-    assert calls == ["stale-sess", None]
     assert "fresh reply" in reply
     assert "started a new Claude session" in reply
-    assert bridge._sessions.get("discord:c1") == "new-sess"
+    assert not_found.killed is True
+    assert "--resume" in spawn.call_args_list[0].args
+    assert "--resume" not in spawn.call_args_list[1].args
+    assert bridge._sessions.get("discord:c1") == "new-session"
+    await bridge.close()
 
 
-def test_timeout_does_not_trigger_resume_fallback(monkeypatch, hermes_home):
-    calls = []
+@pytest.mark.asyncio
+async def test_existing_process_error_does_not_trigger_resume_fallback(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[
+        [_result("first", "saved-session")],
+        [(json.dumps({
+            "type": "result", "is_error": True, "result": "ordinary failure",
+            "session_id": "saved-session", "subtype": "error_during_execution",
+            "num_turns": 0,
+        }) + "\n").encode()],
+    ])
+    spawn = AsyncMock(return_value=proc)
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home)
 
-    async def _fake_spawn(*, resume_session_id, **kwargs):
-        calls.append(resume_session_id)
-        return _SpawnOutcome(error="claude timed out after 1s", timed_out=True)
+    assert await bridge.handle_message(_event("first")) == "first"
+    reply = await bridge.handle_message(_event("second"))
 
-    monkeypatch.setattr("gateway.claude_bridge._spawn_claude", _fake_spawn)
-
-    bridge = ClaudeBridge(ClaudeBridgeConfig(enabled=True, working_dir=str(hermes_home)))
-    bridge._sessions.set("discord:c1", "stale-sess")
-
-    reply = asyncio.run(bridge.handle_message(_event("hello")))
-
-    assert calls == ["stale-sess"]  # no fresh-spawn retry
-    assert "timed out" in reply
+    assert reply == "Claude bridge error: ordinary failure"
+    assert spawn.await_count == 1
+    assert proc.killed is False
+    assert bridge._sessions.get("discord:c1") == "saved-session"
+    await bridge.close()
 
 
-def test_is_error_response_surfaces_result_text(monkeypatch, hermes_home):
-    from gateway.claude_bridge import _SpawnOutcome as _SO
+@pytest.mark.asyncio
+async def test_stderr_drain_uses_chunks_and_retains_tail():
+    proc = _FakeProc(stderr_lines=[b"discard" * 1024, b"final stderr tail"])
+    claude_process = _ClaudeProcess(
+        claude_bin="claude",
+        working_dir="/tmp",
+        resume_session_id=None,
+        extra_args=[],
+    )
+    claude_process.proc = proc
 
-    async def _fake_spawn(**kwargs):
-        return _SO(parsed={"result": "bad prompt", "is_error": True, "session_id": "s1"})
+    await claude_process._drain_stderr()
 
-    monkeypatch.setattr("gateway.claude_bridge._spawn_claude", _fake_spawn)
+    assert proc.stderr.read_sizes == [8192, 8192, 8192]
+    assert claude_process._stderr_summary().endswith("final stderr tail")
+    assert len(claude_process._stderr_tail) == claude_process._STDERR_TAIL_BYTES
 
-    bridge = ClaudeBridge(ClaudeBridgeConfig(enabled=True, working_dir=str(hermes_home)))
-    reply = asyncio.run(bridge.handle_message(_event("hello")))
+
+@pytest.mark.asyncio
+async def test_idle_reaper_continues_after_reap_exception(monkeypatch, hermes_home):
+    bridge = _bridge(hermes_home)
+    sleep = AsyncMock(side_effect=[None, None, asyncio.CancelledError])
+    reap = AsyncMock(side_effect=[RuntimeError("transient failure"), None])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.sleep", sleep)
+    monkeypatch.setattr(bridge, "_reap_idle_processes", reap)
+
+    with pytest.raises(asyncio.CancelledError):
+        await bridge._idle_reaper()
+
+    assert reap.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_error_result_surfaces_result_text(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[(json.dumps({
+        "type": "result", "result": "bad prompt", "is_error": True, "session_id": "s1",
+    }) + "\n").encode()]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    bridge = _bridge(hermes_home)
+
+    reply = await bridge.handle_message(_event("hello"))
 
     assert "Claude bridge error" in reply
     assert "bad prompt" in reply
+    await bridge.close()
 
 
-def test_missing_working_dir_is_reported_without_spawning(monkeypatch, hermes_home):
-    called = False
+@pytest.mark.asyncio
+async def test_prompt_is_never_an_argv_element(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("ok")]])
+    spawn = AsyncMock(return_value=proc)
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home)
+    prompt = "-rf --dangerous text that resembles a command-line flag"
 
-    async def _fail_spawn(*args, **kwargs):
-        nonlocal called
-        called = True
-        raise AssertionError("must not spawn without working_dir")
+    assert await bridge.handle_message(_event(prompt)) == "ok"
 
-    monkeypatch.setattr("gateway.claude_bridge._spawn_claude", _fail_spawn)
+    assert all(prompt not in str(value) for value in spawn.call_args.args)
+    sent = json.loads(proc.stdin.writes[0].decode("utf-8"))
+    assert sent["message"]["content"][0]["text"] == prompt
+    await bridge.close()
 
+
+@pytest.mark.asyncio
+async def test_missing_working_dir_is_reported_without_spawning(monkeypatch, hermes_home):
+    spawn = AsyncMock(side_effect=AssertionError("must not spawn without working_dir"))
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
     bridge = ClaudeBridge(ClaudeBridgeConfig(enabled=True, working_dir=None))
-    reply = asyncio.run(bridge.handle_message(_event("hello")))
+
+    reply = await bridge.handle_message(_event("hello"))
 
     assert "working_dir" in reply
-    assert called is False
+    spawn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_kills_existing_channel_process(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("ok")]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    bridge = _bridge(hermes_home)
+    await bridge.handle_message(_event("hello"))
+
+    reply = await bridge.handle_message(_event("/new"))
+
+    assert "new" in reply.lower()
+    assert proc.killed is True
+    assert "discord:c1" not in bridge._procs
+    assert bridge._sessions.get("discord:c1") is None
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_interrupts_in_flight_turn_without_resume_fallback(monkeypatch, hermes_home):
+    proc = _FakeProc()
+    spawn = AsyncMock(return_value=proc)
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home)
+    bridge._sessions.set("discord:c1", "stale-session")
+
+    in_flight = asyncio.create_task(bridge.handle_message(_event("wait")))
+    await asyncio.sleep(0)
+    stopped = await bridge.handle_message(_event("/stop"))
+    reply = await asyncio.wait_for(in_flight, timeout=1)
+
+    assert "stopped" in stopped.lower()
+    assert "stopped" in reply.lower()
+    assert proc.killed is True
+    assert spawn.await_count == 1
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_process_is_reaped_without_clearing_session(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("ok", "saved-session")]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    bridge = _bridge(hermes_home, idle_timeout_seconds=1)
+    await bridge.handle_message(_event("hello"))
+    bridge._procs["discord:c1"].last_used = time.monotonic() - 2
+
+    await bridge._reap_idle_processes()
+
+    assert proc.killed is True
+    assert "discord:c1" not in bridge._procs
+    assert bridge._sessions.get("discord:c1") == "saved-session"
+    await bridge.close()

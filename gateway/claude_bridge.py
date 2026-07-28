@@ -1,7 +1,9 @@
 """Claude Code CLI bridge.
 
-Routes inbound gateway messages to a spawned ``claude -p`` process instead of
-the built-in agent loop, when opted in via ``GatewayConfig.claude_bridge``.
+Routes inbound gateway messages to one persistent ``claude -p`` process per
+channel instead of the built-in agent loop, when opted in via
+``GatewayConfig.claude_bridge``.  The process speaks line-delimited
+``stream-json`` on stdin/stdout and remains alive across turns.
 Platform-agnostic by design (see ``AGENTS.md`` — platform specifics such as
 Discord's button ``View`` live in the adapter, not here).
 
@@ -23,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -174,79 +177,208 @@ class _SpawnOutcome:
     parsed: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     timed_out: bool = False
+    interrupted: bool = False
 
 
-async def _spawn_claude(
-    *,
-    claude_bin: str,
-    working_dir: str,
-    prompt: str,
-    resume_session_id: Optional[str],
-    extra_args: List[str],
-    timeout_seconds: int,
-) -> _SpawnOutcome:
-    """Spawn ``claude -p`` and parse its JSON output.
+class _ClaudeProcess:
+    """One long-lived ``claude -p`` stream-json subprocess for a channel.
 
-    The prompt is passed via stdin, never as an argv element: a Discord
-    message that happens to start with ``-`` would otherwise be parsed as a
-    CLI flag by ``claude`` (argv injection), and ARG_MAX caps how much text
-    can go through argv at all. ``claude -p`` (no positional prompt
-    argument) reads the prompt from stdin.
-
-    Every failure mode (spawn error, non-zero exit, timeout, unparseable
-    output) is reported via ``_SpawnOutcome.error`` rather than raised, so
-    the caller always has a user-facing message to return — silent failure
-    is not an option for a chat-facing bridge.
+    The user prompt deliberately travels only through a JSON line on stdin,
+    never argv.  Besides avoiding argv injection from messages beginning with
+    ``-``, this avoids the operating system's argv-size limit for large chat
+    messages.
     """
-    args = [claude_bin, "-p", "--output-format", "json"]
-    if resume_session_id:
-        args += ["--resume", resume_session_id]
-    args += list(extra_args)
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=working_dir,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except Exception as exc:
-        return _SpawnOutcome(error=f"failed to spawn `{claude_bin}`: {exc}")
+    _STDERR_TAIL_BYTES = 4 * 1024
 
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode("utf-8")), timeout=timeout_seconds,
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
+    def __init__(
+        self,
+        *,
+        claude_bin: str,
+        working_dir: str,
+        resume_session_id: Optional[str],
+        extra_args: List[str],
+    ):
+        self._claude_bin = claude_bin
+        self._working_dir = working_dir
+        self._resume_session_id = resume_session_id
+        self._extra_args = list(extra_args)
+        self.proc: Optional[asyncio.subprocess.Process] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        self._stderr_tail = ""
+        self._completed_result_count = 0
+        self.last_used = time.monotonic()
+        self.is_turn_active = False
+        self.intentional_stop = False
+
+    @property
+    def is_alive(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
+
+    @property
+    def is_unproven_resume(self) -> bool:
+        return self._resume_session_id is not None and self._completed_result_count == 0
+
+    async def start(self) -> Optional[_SpawnOutcome]:
+        """Launch the stream-json process and begin draining stderr."""
+        args = [
+            self._claude_bin,
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]
+        if self._resume_session_id:
+            args += ["--resume", self._resume_session_id]
+        args += self._extra_args
+
         try:
-            await proc.communicate()
+            # Claude can emit a result line far larger than asyncio's default
+            # 64 KiB StreamReader limit, so keep a deliberately generous cap.
+            self.proc = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=self._working_dir,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=10 * 1024 * 1024,
+            )
+        except Exception as exc:
+            return _SpawnOutcome(error=f"failed to spawn `{self._claude_bin}`: {exc}")
+
+        self._stderr_task = asyncio.create_task(
+            self._drain_stderr(), name="claude-bridge-stderr"
+        )
+        return None
+
+    async def _drain_stderr(self) -> None:
+        """Continuously drain stderr so the child can never block on its pipe."""
+        if self.proc is None or self.proc.stderr is None:
+            return
+        try:
+            while True:
+                chunk = await self.proc.stderr.read(8192)
+                if not chunk:
+                    return
+                self._stderr_tail = (
+                    self._stderr_tail + chunk.decode("utf-8", errors="replace")
+                )[-self._STDERR_TAIL_BYTES:]
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            pass
-        return _SpawnOutcome(
-            error=f"claude timed out after {timeout_seconds}s", timed_out=True,
+            logger.warning(
+                "claude_bridge: stderr drain stopped; child may block on stderr",
+                exc_info=True,
+            )
+
+    def _stderr_summary(self) -> str:
+        return self._stderr_tail.strip() or "(no stderr)"
+
+    async def send_turn(self, prompt: str, timeout_seconds: int) -> _SpawnOutcome:
+        """Write one user event and wait for its terminating result event."""
+        if not self.is_alive or self.proc is None or self.proc.stdin is None:
+            return _SpawnOutcome(error="claude process is not running")
+        if self.intentional_stop:
+            return _SpawnOutcome(error="Claude turn was stopped", interrupted=True)
+
+        event = {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": prompt}],
+            },
+        }
+        payload = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+            "utf-8"
         )
+        self.is_turn_active = True
+        self.last_used = time.monotonic()
+        try:
+            self.proc.stdin.write(payload)
+            await asyncio.wait_for(self.proc.stdin.drain(), timeout=timeout_seconds)
+            return await asyncio.wait_for(self._read_result(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            await self.terminate()
+            return _SpawnOutcome(
+                error=f"claude timed out after {timeout_seconds}s", timed_out=True,
+            )
+        except Exception as exc:
+            if self.intentional_stop:
+                return _SpawnOutcome(error="Claude turn was stopped", interrupted=True)
+            await self.terminate()
+            return _SpawnOutcome(error=f"claude stream failed: {exc}")
+        finally:
+            self.is_turn_active = False
+            self.last_used = time.monotonic()
 
-    if proc.returncode != 0:
-        stderr_text = stderr.decode("utf-8", errors="replace").strip()
-        return _SpawnOutcome(
-            error=f"claude exited {proc.returncode}: {stderr_text[:2000] or '(no stderr)'}"
-        )
+    async def _read_result(self) -> _SpawnOutcome:
+        if self.proc is None or self.proc.stdout is None:
+            return _SpawnOutcome(error="claude process has no stdout stream")
 
-    try:
-        parsed = json.loads(stdout.decode("utf-8", errors="replace"))
-    except Exception as exc:
-        return _SpawnOutcome(error=f"claude produced unparseable output: {exc}")
+        while True:
+            line = await self.proc.stdout.readline()
+            if not line:
+                if self.intentional_stop:
+                    return _SpawnOutcome(error="Claude turn was stopped", interrupted=True)
+                # Give the always-running stderr task one event-loop turn to
+                # consume bytes that arrived alongside stdout's final EOF.
+                # Do not wait for it to finish: a misbehaving child could keep
+                # stderr open after closing stdout, and this error path must
+                # still return promptly.
+                if self._stderr_task is not None and not self._stderr_task.done():
+                    await asyncio.sleep(0)
+                try:
+                    returncode = await self.proc.wait()
+                except Exception:
+                    returncode = self.proc.returncode
+                return _SpawnOutcome(
+                    error=(
+                        "claude process ended before a result "
+                        f"(exit {returncode}): {self._stderr_summary()}"
+                    )
+                )
+            try:
+                event = json.loads(line.decode("utf-8", errors="replace"))
+            except Exception as exc:
+                logger.warning("claude_bridge: ignoring unparseable stream-json line: %s", exc)
+                continue
+            if not isinstance(event, dict):
+                logger.warning("claude_bridge: ignoring non-object stream-json event")
+                continue
+            if event.get("type") == "result":
+                self._completed_result_count += 1
+                return _SpawnOutcome(parsed=event)
 
-    if not isinstance(parsed, dict):
-        return _SpawnOutcome(error="claude produced non-object JSON output")
+    async def terminate(self) -> None:
+        """Kill the subprocess and cancel its stderr drainer, idempotently."""
+        proc = self.proc
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                logger.debug("claude_bridge: failed to kill claude process", exc_info=True)
+            try:
+                await proc.wait()
+            except Exception:
+                logger.debug("claude_bridge: failed to reap claude process", exc_info=True)
 
-    return _SpawnOutcome(parsed=parsed)
+        task = self._stderr_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("claude_bridge: stderr task cleanup failed", exc_info=True)
 
 
 class ClaudeBridge:
-    """Owns spawn serialization, session continuity, and the halt switch."""
+    """Owns persistent Claude processes, session continuity, and halt state."""
 
     def __init__(self, config: ClaudeBridgeConfig):
         self.config = config
@@ -254,6 +386,11 @@ class ClaudeBridge:
         self._key_locks: Dict[str, asyncio.Lock] = {}
         self._key_locks_guard = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(max(1, config.max_concurrency))
+        self._procs: Dict[str, _ClaudeProcess] = {}
+        self._turns_in_progress: set[str] = set()
+        self._stop_requested_keys: set[str] = set()
+        self._idle_reaper_task: Optional[asyncio.Task] = None
+        self._closed = False
         # Surface a misconfiguration at startup rather than staying silent
         # until the first inbound message hits the same check in
         # handle_message() (F7) — a gateway that never receives a message on
@@ -286,6 +423,127 @@ class ClaudeBridge:
         user_id = getattr(source, "user_id", None) if source is not None else None
         return bool(user_id) and str(user_id) in set(self.config.halt_users)
 
+    def _start_idle_reaper(self) -> None:
+        """Start one deferred reaper once the first child exists."""
+        if self._closed or self._idle_reaper_task is not None:
+            return
+        self._idle_reaper_task = asyncio.create_task(
+            self._idle_reaper(), name="claude-bridge-idle-reaper"
+        )
+
+    async def _idle_reaper(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await self._reap_idle_processes()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("claude_bridge: idle process reaper failed")
+
+    async def _reap_idle_processes(self) -> None:
+        """Terminate idle children; their persisted session IDs remain intact."""
+        timeout = self.config.idle_timeout_seconds
+        if timeout <= 0:
+            return
+        now = time.monotonic()
+        for key, proc in list(self._procs.items()):
+            if proc.is_turn_active or now - proc.last_used < timeout:
+                continue
+            logger.info("claude_bridge: reaping idle process for %s", key)
+            await self._discard_process(key, proc)
+
+    async def _discard_process(
+        self,
+        key: str,
+        process: Optional[_ClaudeProcess] = None,
+        *,
+        intentional_stop: bool = False,
+    ) -> None:
+        """Remove and terminate a process, without altering its session map."""
+        proc = process or self._procs.get(key)
+        if proc is None:
+            return
+        if self._procs.get(key) is proc:
+            self._procs.pop(key, None)
+        if intentional_stop:
+            proc.intentional_stop = True
+        await proc.terminate()
+
+    async def _discard_all_processes(self, *, intentional_stop: bool = False) -> None:
+        processes = list(self._procs.items())
+        self._procs.clear()
+        for _key, proc in processes:
+            if intentional_stop:
+                proc.intentional_stop = True
+        await asyncio.gather(
+            *(proc.terminate() for _key, proc in processes), return_exceptions=True,
+        )
+
+    async def _get_or_spawn_process(
+        self, key: str, resume_session_id: Optional[str]
+    ) -> tuple[Optional[_ClaudeProcess], Optional[_SpawnOutcome]]:
+        existing = self._procs.get(key)
+        if existing is not None and existing.is_alive:
+            return existing, None
+        if existing is not None:
+            await self._discard_process(key, existing)
+
+        proc = _ClaudeProcess(
+            claude_bin=self.config.claude_bin,
+            working_dir=self.config.working_dir,
+            resume_session_id=resume_session_id,
+            extra_args=self.config.extra_args,
+        )
+        spawn_error = await proc.start()
+        if spawn_error is not None:
+            return None, spawn_error
+        # /stop is intentionally handled outside the per-key lock so it can
+        # interrupt an active read.  It may arrive while this process is still
+        # spawning, in which case consume the pending stop before any input.
+        if key in self._stop_requested_keys or self._is_halted():
+            await self._discard_process(key, proc, intentional_stop=True)
+            return None, _SpawnOutcome(error="Claude turn was stopped", interrupted=True)
+        self._procs[key] = proc
+        self._start_idle_reaper()
+        return proc, None
+
+    @staticmethod
+    def _is_resume_failure(parsed: Dict[str, Any]) -> bool:
+        errors = parsed.get("errors")
+        error_text = (
+            "\n".join(str(item) for item in errors)
+            if isinstance(errors, list)
+            else str(errors or "")
+        )
+        if "No conversation found" in error_text:
+            return True
+        return (
+            parsed.get("subtype") == "error_during_execution"
+            and parsed.get("num_turns") == 0
+        )
+
+    def _save_result_session(self, key: str, outcome: _SpawnOutcome) -> None:
+        parsed = outcome.parsed
+        if parsed is None:
+            return
+        session_id = parsed.get("session_id")
+        if session_id:
+            self._sessions.set(key, str(session_id))
+
+    async def close(self) -> None:
+        """Stop the reaper and all resident subprocesses during gateway exit."""
+        self._closed = True
+        task = self._idle_reaper_task
+        self._idle_reaper_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self._discard_all_processes(intentional_stop=True)
+
     async def handle_message(self, event: MessageEvent) -> Optional[str]:
         """Gateway ``MessageHandler``: replaces ``_handle_message`` when enabled."""
         text = (event.text or "").strip()
@@ -295,6 +553,7 @@ class ClaudeBridge:
                 return "Not authorized to halt the Claude bridge."
             halt_flag_file().parent.mkdir(parents=True, exist_ok=True)
             halt_flag_file().touch(exist_ok=True)
+            await self._discard_all_processes(intentional_stop=True)
             return "halted"
 
         if text == "!unhalt":
@@ -309,25 +568,22 @@ class ClaudeBridge:
         if self._is_halted():
             return "Claude bridge is halted (send !unhalt to resume)."
 
-        # Session-scoped commands the gateway's own agent loop understands
-        # (/new, /reset, /stop) have no meaning to a bare `claude -p` spawn —
-        # without handling them here they'd be sent straight through as a
-        # literal prompt. /new and /reset both mean "forget the stored
-        # session_id, start fresh"; /stop has no bridge equivalent (there is
-        # no in-flight agent turn to interrupt) so it's rejected explicitly
-        # rather than silently becoming a prompt.
+        # Session-scoped commands must not be sent through as literal Claude
+        # prompts.  /stop stays outside the per-key lock to interrupt a turn
+        # that is currently awaiting its result event.
         key = channel_key(event)
         command = event.get_command()
         if command in ("new", "reset"):
             lock = await self._lock_for(key)
             async with lock:
+                await self._discard_process(key)
                 self._sessions.clear(key)
             return "Started a new Claude session for this channel."
         if command == "stop":
-            return (
-                "claude_bridge doesn't support /stop — wait for the current "
-                "spawn to finish, or send !halt to stop starting new ones."
-            )
+            if key in self._turns_in_progress:
+                self._stop_requested_keys.add(key)
+            await self._discard_process(key, intentional_stop=True)
+            return "Claude turn stopped."
 
         if not self.config.working_dir:
             logger.error(
@@ -342,58 +598,70 @@ class ClaudeBridge:
 
     async def _handle_locked(self, key: str, text: str) -> str:
         resume_id = self._sessions.get(key)
-        outcome = await _spawn_claude(
-            claude_bin=self.config.claude_bin,
-            working_dir=self.config.working_dir,
-            prompt=text,
-            resume_session_id=resume_id,
-            extra_args=self.config.extra_args,
-            timeout_seconds=self.config.timeout_seconds,
-        )
+        self._turns_in_progress.add(key)
+        try:
+            proc, spawn_error = await self._get_or_spawn_process(key, resume_id)
+            attempted_resume = proc is not None and proc.is_unproven_resume
+            outcome = spawn_error or await proc.send_turn(text, self.config.timeout_seconds)
+            self._save_result_session(key, outcome)
 
-        fallback_note = ""
-        # A resume failure most often means claude no longer recognizes the
-        # stored session_id (e.g. its local history was pruned) — fall back
-        # to a fresh spawn rather than leaving the user stuck. Skip this for
-        # timeouts: a slow *resume* almost certainly means a slow *fresh*
-        # spawn too, and retrying would silently double the user's wait.
-        if outcome.parsed is None and resume_id and not outcome.timed_out:
-            logger.warning(
-                "claude_bridge: resume failed for %s (%s); retrying as a new session",
-                key, outcome.error,
+            # A process which timed out or ended mid-turn is unusable.  Its
+            # saved session ID is intentionally retained so a later turn can
+            # launch --resume and preserve context.
+            if outcome.parsed is None:
+                if proc is not None:
+                    await self._discard_process(key, proc)
+                if outcome.interrupted:
+                    return "Claude turn stopped."
+                return f"Claude bridge error: {outcome.error}"
+
+            fallback_note = ""
+            # A stale --resume ID is reported as an error *result*, not a
+            # non-zero process exit.  Retry exactly once as a fresh process;
+            # timeouts and intentional /stop interruptions never retry.
+            if (
+                attempted_resume
+                and outcome.parsed.get("is_error")
+                and self._is_resume_failure(outcome.parsed)
+                and not outcome.timed_out
+                and not outcome.interrupted
+            ):
+                logger.warning(
+                    "claude_bridge: resume failed for %s; retrying as a new session", key
+                )
+                if proc is not None:
+                    await self._discard_process(key, proc)
+                self._sessions.clear(key)
+                proc, spawn_error = await self._get_or_spawn_process(key, None)
+                outcome = spawn_error or await proc.send_turn(text, self.config.timeout_seconds)
+                self._save_result_session(key, outcome)
+                fallback_note = "\n\n(resume failed — started a new Claude session)"
+
+            if outcome.parsed is None:
+                if proc is not None:
+                    await self._discard_process(key, proc)
+                if outcome.interrupted:
+                    return "Claude turn stopped."
+                return f"Claude bridge error: {outcome.error}{fallback_note}"
+
+            parsed = outcome.parsed
+            session_id = parsed.get("session_id")
+            logger.info(
+                "claude_bridge: key=%s session=%s cost=%s is_error=%s",
+                key, session_id, parsed.get("total_cost_usd"), parsed.get("is_error"),
             )
-            self._sessions.clear(key)
-            outcome = await _spawn_claude(
-                claude_bin=self.config.claude_bin,
-                working_dir=self.config.working_dir,
-                prompt=text,
-                resume_session_id=None,
-                extra_args=self.config.extra_args,
-                timeout_seconds=self.config.timeout_seconds,
-            )
-            fallback_note = "\n\n(resume failed — started a new Claude session)"
 
-        if outcome.parsed is None:
-            return f"Claude bridge error: {outcome.error}"
+            result_text = parsed.get("result")
+            if parsed.get("is_error"):
+                return f"Claude bridge error: {result_text or '(no result text)'}{fallback_note}"
 
-        parsed = outcome.parsed
-        session_id = parsed.get("session_id")
-        if session_id:
-            self._sessions.set(key, str(session_id))
+            if not isinstance(result_text, str) or not result_text.strip():
+                return f"Claude bridge: empty result from claude{fallback_note}"
 
-        logger.info(
-            "claude_bridge: key=%s session=%s cost=%s is_error=%s",
-            key, session_id, parsed.get("total_cost_usd"), parsed.get("is_error"),
-        )
-
-        result_text = parsed.get("result")
-        if parsed.get("is_error"):
-            return f"Claude bridge error: {result_text or '(no result text)'}{fallback_note}"
-
-        if not isinstance(result_text, str) or not result_text.strip():
-            return f"Claude bridge: empty result from claude{fallback_note}"
-
-        return f"{result_text}{fallback_note}"
+            return f"{result_text}{fallback_note}"
+        finally:
+            self._turns_in_progress.discard(key)
+            self._stop_requested_keys.discard(key)
 
 
 # Sized for Discord's 100-char button custom_id budget

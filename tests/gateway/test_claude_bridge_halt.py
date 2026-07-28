@@ -6,6 +6,8 @@ until explicitly lifted.
 """
 
 import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -35,6 +37,26 @@ def _event(text: str, user_id: str = "u1") -> MessageEvent:
 def _bridge(hermes_home, **overrides) -> ClaudeBridge:
     cfg = ClaudeBridgeConfig(enabled=True, working_dir=str(hermes_home), **overrides)
     return ClaudeBridge(cfg)
+
+
+def _successful_process():
+    proc = MagicMock()
+    proc.returncode = None
+    proc.stdin = MagicMock()
+    proc.stdin.drain = AsyncMock()
+    proc.stdout = MagicMock()
+    proc.stdout.readline = AsyncMock(return_value=(json.dumps({
+        "type": "result", "result": "ok", "session_id": "s1", "is_error": False,
+    }) + "\n").encode())
+    proc.stderr = MagicMock()
+    proc.stderr.read = AsyncMock(return_value=b"")
+    proc.wait = AsyncMock(return_value=0)
+
+    def _kill():
+        proc.returncode = -9
+
+    proc.kill.side_effect = _kill
+    return proc
 
 
 def test_halt_and_unhalt_roundtrip(hermes_home):
@@ -93,7 +115,10 @@ def test_halted_state_blocks_spawn_without_calling_it(hermes_home, monkeypatch):
         called = True
         raise AssertionError("must not spawn while halted")
 
-    monkeypatch.setattr("gateway.claude_bridge._spawn_claude", _fail_spawn)
+    monkeypatch.setattr(
+        "gateway.claude_bridge.asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=_fail_spawn),
+    )
 
     reply = asyncio.run(bridge.handle_message(_event("hello claude")))
     assert "halted" in reply.lower()
@@ -105,12 +130,10 @@ def test_unhalt_allows_spawn_again(hermes_home, monkeypatch):
     asyncio.run(bridge.handle_message(_event("!halt")))
     asyncio.run(bridge.handle_message(_event("!unhalt")))
 
-    from gateway.claude_bridge import _SpawnOutcome
-
-    async def _fake_spawn(*args, **kwargs):
-        return _SpawnOutcome(parsed={"result": "ok", "session_id": "s1", "is_error": False})
-
-    monkeypatch.setattr("gateway.claude_bridge._spawn_claude", _fake_spawn)
+    monkeypatch.setattr(
+        "gateway.claude_bridge.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=_successful_process()),
+    )
 
     reply = asyncio.run(bridge.handle_message(_event("hello claude")))
     assert reply == "ok"

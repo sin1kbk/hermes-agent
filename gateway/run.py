@@ -8151,6 +8151,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._draining = True
 
+            # Claude bridge turns are not represented by ``_running_agents``.
+            # Close them explicitly so shutdown does not leave resident CLI
+            # subprocesses (or its idle reaper task) behind.
+            try:
+                await self.claude_bridge.close()
+            except Exception as _e:
+                logger.warning("Claude bridge cleanup during shutdown failed: %s", _e, exc_info=True)
+
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()

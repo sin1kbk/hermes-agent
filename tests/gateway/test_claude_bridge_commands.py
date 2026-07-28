@@ -1,13 +1,13 @@
-"""Regression tests for F5: /new, /reset, /stop must not reach claude as a
-literal prompt.
+"""Regression tests for bridge session commands.
 
-The gateway's own agent loop treats these as session-scoped commands;
-ClaudeBridge has no equivalent concept of an in-flight turn to interrupt or
-reset, so it must intercept them explicitly instead of spawning `claude -p
-"/new"`.
+The gateway's own agent loop treats these as session-scoped commands.  The
+bridge intercepts them instead of sending a literal prompt to Claude; /stop
+now interrupts a persistent process when one is active.
 """
 
 import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -42,7 +42,29 @@ def _never_spawn(monkeypatch):
     async def _fail(*args, **kwargs):
         raise AssertionError("must not spawn claude for a session-scoped command")
 
-    monkeypatch.setattr("gateway.claude_bridge._spawn_claude", _fail)
+    monkeypatch.setattr(
+        "gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(side_effect=_fail),
+    )
+
+
+def _successful_process():
+    proc = MagicMock()
+    proc.returncode = None
+    proc.stdin = MagicMock()
+    proc.stdin.drain = AsyncMock()
+    proc.stdout = MagicMock()
+    proc.stdout.readline = AsyncMock(return_value=(json.dumps({
+        "type": "result", "result": "ok", "session_id": "s1", "is_error": False,
+    }) + "\n").encode())
+    proc.stderr = MagicMock()
+    proc.stderr.read = AsyncMock(return_value=b"")
+    proc.wait = AsyncMock(return_value=0)
+
+    def _kill():
+        proc.returncode = -9
+
+    proc.kill.side_effect = _kill
+    return proc
 
 
 @pytest.mark.parametrize("command", ["/new", "/reset"])
@@ -58,15 +80,14 @@ def test_new_and_reset_clear_session_without_spawning(hermes_home, monkeypatch, 
     assert "new" in reply.lower()
 
 
-def test_stop_returns_explicit_unsupported_message_without_spawning(hermes_home, monkeypatch):
+def test_stop_returns_stopped_message_without_spawning(hermes_home, monkeypatch):
     _never_spawn(monkeypatch)
     bridge = _bridge(hermes_home)
 
     reply = asyncio.run(bridge.handle_message(_event("/stop")))
 
     assert reply is not None
-    assert "stop" in reply.lower()
-    assert "support" in reply.lower()
+    assert "stopped" in reply.lower()
 
 
 def test_new_with_trailing_text_still_recognized_as_command(hermes_home, monkeypatch):
@@ -84,12 +105,10 @@ def test_new_with_trailing_text_still_recognized_as_command(hermes_home, monkeyp
 def test_non_command_slash_text_is_not_intercepted(hermes_home, monkeypatch):
     """Only recognized command names are intercepted — ordinary text starting
     with '/' (e.g. a shell path in a prompt) still reaches claude."""
-    from gateway.claude_bridge import _SpawnOutcome
-
-    async def _fake_spawn(**kwargs):
-        return _SpawnOutcome(parsed={"result": "ok", "session_id": "s1", "is_error": False})
-
-    monkeypatch.setattr("gateway.claude_bridge._spawn_claude", _fake_spawn)
+    monkeypatch.setattr(
+        "gateway.claude_bridge.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=_successful_process()),
+    )
     bridge = _bridge(hermes_home)
 
     reply = asyncio.run(bridge.handle_message(_event("/usr/bin/env check this path")))

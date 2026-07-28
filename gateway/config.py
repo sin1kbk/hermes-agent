@@ -627,6 +627,10 @@ class ClaudeBridgeConfig:
     claude_bin: str = "claude"
     max_concurrency: int = 2
     timeout_seconds: int = 900
+    # Reap an unused persistent CLI process after this many seconds.  Its
+    # session_id remains in sessions.json and the next message resumes it.
+    # 0 or a negative value disables idle reaping.
+    idle_timeout_seconds: int = 1800
     # User IDs allowed to send !halt / !unhalt. Empty = anyone may.
     halt_users: List[str] = field(default_factory=list)
     # Extra argv appended to the `claude -p ...` invocation.
@@ -645,6 +649,7 @@ class ClaudeBridgeConfig:
             "claude_bin": self.claude_bin,
             "max_concurrency": self.max_concurrency,
             "timeout_seconds": self.timeout_seconds,
+            "idle_timeout_seconds": self.idle_timeout_seconds,
             "halt_users": list(self.halt_users),
             "extra_args": list(self.extra_args),
             "decision_channels": list(self.decision_channels),
@@ -670,6 +675,7 @@ class ClaudeBridgeConfig:
             claude_bin=data.get("claude_bin") or "claude",
             max_concurrency=_coerce_int(data.get("max_concurrency"), 2),
             timeout_seconds=_coerce_int(data.get("timeout_seconds"), 900),
+            idle_timeout_seconds=_coerce_int(data.get("idle_timeout_seconds"), 1800),
             halt_users=[str(u) for u in halt_users],
             extra_args=[str(a) for a in extra_args],
             decision_channels=[str(c) for c in decision_channels],

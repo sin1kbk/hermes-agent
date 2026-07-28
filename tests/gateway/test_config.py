@@ -302,9 +302,11 @@ class TestClaudeBridgeConfig:
     def test_roundtrips_decision_channels(self):
         cfg = ClaudeBridgeConfig(
             enabled=True, working_dir="/repo", decision_channels=["123", "456"],
+            idle_timeout_seconds=321,
         )
         restored = ClaudeBridgeConfig.from_dict(cfg.to_dict())
         assert restored.decision_channels == ["123", "456"]
+        assert restored.idle_timeout_seconds == 321
 
     def test_non_list_decision_channels_falls_back_to_empty(self):
         restored = ClaudeBridgeConfig.from_dict({"decision_channels": "not-a-list"})
