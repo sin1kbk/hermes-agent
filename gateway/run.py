@@ -1736,6 +1736,7 @@ if not _configured_cwd or _configured_cwd in CWD_PLACEHOLDERS:
 
 from gateway.config import (
     ChannelOverride,
+    ClaudeBridgeConfig,
     Platform,
     _BUILTIN_PLATFORM_VALUES,
     GatewayConfig,
@@ -1753,6 +1754,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
+from gateway.claude_bridge import ClaudeBridge, OutboxWatcher
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
@@ -2800,6 +2802,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+    # Disabled-by-default singleton so ``GatewayRunner.__new__(GatewayRunner)``
+    # test doubles (common in this suite) don't need to know about the Claude
+    # bridge to exercise unrelated methods via ``_select_message_handler()``.
+    claude_bridge: "ClaudeBridge" = ClaudeBridge(ClaudeBridgeConfig())
+    _claude_bridge_outbox_watcher: Optional["OutboxWatcher"] = None
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -2813,6 +2820,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             set_multiplex_active(bool(getattr(self.config, "multiplex_profiles", False)))
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
+        self.claude_bridge = ClaudeBridge(self.config.claude_bridge)
+        self._claude_bridge_outbox_watcher: Optional[OutboxWatcher] = None
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
@@ -7060,7 +7069,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             
             # Set up message + fatal error handlers
-            adapter.set_message_handler(self._handle_message)
+            adapter.set_message_handler(self._select_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -7401,6 +7410,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is ignored via its instantiation epoch; only a current-epoch marker
         # engages drain on the first tick.
         asyncio.create_task(self._drain_control_watcher())
+
+        # Start the Claude bridge escalation-outbox watcher. Only meaningful
+        # once a platform that knows how to render decision buttons is
+        # connected — currently Discord only.
+        if self.claude_bridge.enabled:
+            self._start_claude_bridge_outbox_watcher()
 
         logger.info("Press Ctrl+C to stop")
         
@@ -7896,7 +7911,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
-                    adapter.set_message_handler(self._handle_message)
+                    adapter.set_message_handler(self._select_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -8634,7 +8649,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event.source.profile = profile_name
             except Exception:
                 pass
-            return await self._handle_message(event)
+            return await self._select_message_handler()(event)
         return _handler
 
     @staticmethod
@@ -8849,6 +8864,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         await adapter.send(source.chat_id, content, metadata=metadata)
+
+    def _select_message_handler(self) -> Callable[[MessageEvent], "asyncio.Future"]:
+        """Return the handler adapters should register for inbound messages.
+
+        Every registration site (initial connect, reconnect, and the
+        multiplex per-profile wrapper) routes through here so the Claude
+        bridge opt-in has exactly one switch. ``claude_bridge.enabled=False``
+        (the default) always returns ``self._handle_message`` unchanged.
+        """
+        if self.claude_bridge.enabled:
+            return self.claude_bridge.handle_message
+        return self._handle_message
+
+    def _start_claude_bridge_outbox_watcher(self) -> None:
+        """Start the Claude bridge escalation watcher if a poster platform is up.
+
+        Discord is the only platform with a decision-button ``View`` today
+        (``DiscordAdapter.post_claude_bridge_decision``). No-ops quietly when
+        Discord isn't connected — the bridge's normal message handling still
+        works, it just has no channel to post escalation decisions into.
+        """
+        discord_adapter = self.adapters.get(Platform.DISCORD)
+        poster = getattr(discord_adapter, "post_claude_bridge_decision", None)
+        if poster is None:
+            logger.info(
+                "claude_bridge: enabled but no platform can render decision "
+                "buttons yet (Discord not connected) — escalation outbox idle"
+            )
+            return
+        self._claude_bridge_outbox_watcher = OutboxWatcher(poster)
+        asyncio.create_task(self._claude_bridge_outbox_watcher.run())
+        logger.info("claude_bridge: escalation outbox watcher started (discord)")
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
