@@ -5863,7 +5863,7 @@ class DiscordAdapter(BasePlatformAdapter):
         embed = discord.Embed(
             title="🔀 Claude bridge needs a decision",
             description=question,
-            color=discord.Color.blurple(),
+            color=discord.Color.blue(),
         )
         if options:
             lines = []
@@ -7845,6 +7845,40 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
+            user = getattr(interaction, "user", None)
+            display_name = getattr(user, "display_name", "user")
+            user_id = getattr(user, "id", None)
+
+            # Persist BEFORE flipping resolved/disabling buttons: if the write
+            # fails, the message must not look answered while
+            # claude_bridge/decisions/ has nothing recorded — that would be
+            # unrecoverable (resolved=True blocks every future click). Leave
+            # the buttons live so the click can be retried.
+            try:
+                from gateway.claude_bridge import write_decision_answer
+                write_decision_answer(
+                    self.decision_id, opt_id, str(user_id) if user_id else None,
+                )
+            except Exception:
+                logger.exception(
+                    "claude_bridge: failed to write decision answer for %s",
+                    self.decision_id,
+                )
+                embed = interaction.message.embeds[0] if (
+                    interaction.message and interaction.message.embeds
+                ) else None
+                if embed:
+                    embed.color = discord.Color.red()
+                    embed.set_footer(text="⚠ Failed to record your answer — please try again")
+                try:
+                    await interaction.response.edit_message(embed=embed, view=self)
+                except Exception:
+                    try:
+                        await interaction.response.defer()
+                    except Exception:
+                        pass
+                return
+
             self.resolved = True
             for child in self.children:
                 child.disabled = True
@@ -7852,9 +7886,6 @@ def _define_discord_view_classes() -> None:
             embed = interaction.message.embeds[0] if (
                 interaction.message and interaction.message.embeds
             ) else None
-            user = getattr(interaction, "user", None)
-            display_name = getattr(user, "display_name", "user")
-            user_id = getattr(user, "id", None)
             if embed:
                 embed.color = discord.Color.green()
                 embed.set_footer(text=f"Answered by {display_name}: {label}")
@@ -7866,17 +7897,6 @@ def _define_discord_view_classes() -> None:
                     await interaction.response.defer()
                 except Exception:
                     pass
-
-            try:
-                from gateway.claude_bridge import write_decision_answer
-                write_decision_answer(
-                    self.decision_id, opt_id, str(user_id) if user_id else None,
-                )
-            except Exception:
-                logger.exception(
-                    "claude_bridge: failed to write decision answer for %s",
-                    self.decision_id,
-                )
 
         async def on_timeout(self):
             self.resolved = True
