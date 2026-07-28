@@ -345,6 +345,16 @@ class ClaudeBridge:
         return f"{result_text}{fallback_note}"
 
 
+# Sized for Discord's 100-char button custom_id budget
+# ("claude_bridge_decision:<decision_id>:<option_id>" — a 23-char prefix
+# plus 2 separators leaves 76 chars for decision_id + option_id combined).
+# Discord is the only decision renderer today, but the cap is enforced here
+# (platform-agnostic) so any future renderer inherits the same safe bound
+# instead of discovering its own limit via a posting exception.
+MAX_DECISION_ID_LEN = 32
+MAX_OPTION_ID_LEN = 32
+
+
 class OutboxWatcher:
     """Polls ``claude_bridge/outbox/*.json`` and hands each to ``poster``.
 
@@ -358,18 +368,19 @@ class OutboxWatcher:
         self,
         poster: Callable[[Dict[str, Any]], Awaitable[None]],
         interval: float = 2.0,
+        allowed_channels: Optional[List[str]] = None,
     ):
         self._poster = poster
         self._interval = interval
         self._stop = asyncio.Event()
+        # Non-empty restricts which outbox channel_id values are honored
+        # (C3) — empty (the default) means unrestricted.
+        self._allowed_channels = set(allowed_channels) if allowed_channels else None
 
     def stop(self) -> None:
         self._stop.set()
 
     async def run(self) -> None:
-        outbox_dir().mkdir(parents=True, exist_ok=True)
-        outbox_processed_dir().mkdir(parents=True, exist_ok=True)
-        outbox_failed_dir().mkdir(parents=True, exist_ok=True)
         while not self._stop.is_set():
             try:
                 await self._tick()
@@ -381,6 +392,13 @@ class OutboxWatcher:
                 pass
 
     async def _tick(self) -> None:
+        # Re-created every tick (cheap, idempotent) rather than once in
+        # run(): a failure here must go through the same per-tick
+        # try/except as the rest of the loop and be retried next tick,
+        # not kill the whole watcher task before it logs anything.
+        outbox_dir().mkdir(parents=True, exist_ok=True)
+        outbox_processed_dir().mkdir(parents=True, exist_ok=True)
+        outbox_failed_dir().mkdir(parents=True, exist_ok=True)
         for path in sorted(outbox_dir().glob("*.json")):
             if path.is_file():
                 await self._process_one(path)
@@ -401,6 +419,35 @@ class OutboxWatcher:
             self._move(path, outbox_failed_dir())
             return
 
+        decision_id = str(data.get("decision_id"))
+        if len(decision_id) > MAX_DECISION_ID_LEN:
+            logger.warning(
+                "claude_bridge: outbox file %s decision_id is %d chars (max %d)",
+                path.name, len(decision_id), MAX_DECISION_ID_LEN,
+            )
+            self._move(path, outbox_failed_dir())
+            return
+        for opt in (data.get("options") or []):
+            opt_id = str(opt.get("id")) if isinstance(opt, dict) else ""
+            if len(opt_id) > MAX_OPTION_ID_LEN:
+                logger.warning(
+                    "claude_bridge: outbox file %s has an option id of %d chars (max %d)",
+                    path.name, len(opt_id), MAX_OPTION_ID_LEN,
+                )
+                self._move(path, outbox_failed_dir())
+                return
+
+        if self._allowed_channels is not None:
+            channel_id = str(data.get("channel_id"))
+            if channel_id not in self._allowed_channels:
+                logger.warning(
+                    "claude_bridge: outbox file %s channel_id %r is not in "
+                    "claude_bridge.decision_channels — refusing to post",
+                    path.name, channel_id,
+                )
+                self._move(path, outbox_failed_dir())
+                return
+
         try:
             await self._poster(data)
         except Exception:
@@ -408,12 +455,31 @@ class OutboxWatcher:
             self._move(path, outbox_failed_dir())
             return
 
-        self._move(path, outbox_processed_dir())
+        if not self._move(path, outbox_processed_dir()):
+            # The decision was already posted — leaving the source file in
+            # outbox/ would re-post it every tick forever. Rename it out of
+            # the *.json glob in place so it's excluded from the next scan,
+            # even though it isn't in processed/ where it belongs.
+            logger.error(
+                "claude_bridge: posted %s but could not move it to processed/ "
+                "— renamed in place to avoid a duplicate-post loop; move it "
+                "to outbox/processed/ manually",
+                path.name,
+            )
+            try:
+                path.replace(path.with_name(path.name + ".posted"))
+            except Exception:
+                logger.exception(
+                    "claude_bridge: failed to even rename %s out of the outbox "
+                    "glob — it WILL be re-posted next tick", path,
+                )
 
     @staticmethod
-    def _move(path: Path, dest_dir: Path) -> None:
+    def _move(path: Path, dest_dir: Path) -> bool:
         dest_dir.mkdir(parents=True, exist_ok=True)
         try:
             path.replace(dest_dir / path.name)
+            return True
         except Exception:
             logger.exception("claude_bridge: failed to move %s -> %s", path, dest_dir)
+            return False

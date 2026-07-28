@@ -8,10 +8,13 @@ the plugin's own adapter tests.
 
 import asyncio
 import json
+from unittest.mock import patch
 
 import pytest
 
 from gateway.claude_bridge import (
+    MAX_DECISION_ID_LEN,
+    MAX_OPTION_ID_LEN,
     OutboxWatcher,
     decisions_dir,
     outbox_dir,
@@ -139,3 +142,133 @@ def test_write_decision_answer_is_atomic_no_tmp_left_behind(hermes_home):
     write_decision_answer("d5", "a", None)
     assert not (decisions_dir() / "d5.json.tmp").exists()
     assert (decisions_dir() / "d5.json").exists()
+
+
+# --- C3: decision_channels allowlist ---------------------------------------
+
+
+def test_channel_outside_allowlist_moved_to_failed(hermes_home):
+    decision = {"decision_id": "d6", "channel_id": "999", "question": "q", "options": []}
+    _write_outbox_file("d6.json", decision)
+
+    async def _poster(data):
+        raise AssertionError("poster must not be called for a non-allowlisted channel")
+
+    watcher = OutboxWatcher(_poster, interval=999, allowed_channels=["123", "456"])
+    asyncio.run(watcher._tick())
+
+    assert (outbox_failed_dir() / "d6.json").exists()
+
+
+def test_channel_inside_allowlist_is_posted(hermes_home):
+    decision = {"decision_id": "d7", "channel_id": "123", "question": "q", "options": []}
+    _write_outbox_file("d7.json", decision)
+
+    posted = []
+
+    async def _poster(data):
+        posted.append(data["decision_id"])
+
+    watcher = OutboxWatcher(_poster, interval=999, allowed_channels=["123", "456"])
+    asyncio.run(watcher._tick())
+
+    assert posted == ["d7"]
+    assert (outbox_processed_dir() / "d7.json").exists()
+
+
+def test_empty_allowlist_means_unrestricted(hermes_home):
+    decision = {"decision_id": "d8", "channel_id": "anything", "question": "q", "options": []}
+    _write_outbox_file("d8.json", decision)
+
+    posted = []
+
+    async def _poster(data):
+        posted.append(data["decision_id"])
+
+    watcher = OutboxWatcher(_poster, interval=999, allowed_channels=[])
+    asyncio.run(watcher._tick())
+
+    assert posted == ["d8"]
+
+
+# --- F8: decision_id / option id length bound (Discord custom_id budget) ---
+
+
+def test_oversized_decision_id_moved_to_failed(hermes_home):
+    decision = {
+        "decision_id": "x" * (MAX_DECISION_ID_LEN + 1),
+        "channel_id": "1", "question": "q", "options": [],
+    }
+    _write_outbox_file("long_id.json", decision)
+
+    async def _poster(data):
+        raise AssertionError("poster must not be called for an oversized decision_id")
+
+    watcher = OutboxWatcher(_poster, interval=999)
+    asyncio.run(watcher._tick())
+
+    assert (outbox_failed_dir() / "long_id.json").exists()
+
+
+def test_oversized_option_id_moved_to_failed(hermes_home):
+    decision = {
+        "decision_id": "d9", "channel_id": "1", "question": "q",
+        "options": [{"id": "y" * (MAX_OPTION_ID_LEN + 1), "label": "L"}],
+    }
+    _write_outbox_file("long_opt.json", decision)
+
+    async def _poster(data):
+        raise AssertionError("poster must not be called for an oversized option id")
+
+    watcher = OutboxWatcher(_poster, interval=999)
+    asyncio.run(watcher._tick())
+
+    assert (outbox_failed_dir() / "long_opt.json").exists()
+
+
+def test_ids_at_the_limit_are_accepted(hermes_home):
+    decision = {
+        "decision_id": "x" * MAX_DECISION_ID_LEN,
+        "channel_id": "1", "question": "q",
+        "options": [{"id": "y" * MAX_OPTION_ID_LEN, "label": "L"}],
+    }
+    _write_outbox_file("at_limit.json", decision)
+
+    posted = []
+
+    async def _poster(data):
+        posted.append(data)
+
+    watcher = OutboxWatcher(_poster, interval=999)
+    asyncio.run(watcher._tick())
+
+    assert posted == [decision]
+    assert (outbox_processed_dir() / "at_limit.json").exists()
+
+
+# --- F6: a move-to-processed failure after a successful post must not loop -
+
+
+def test_move_failure_after_successful_post_renames_in_place(hermes_home):
+    """If the decision was already posted but the processed/ move fails, the
+    file must be renamed out of the *.json glob so it isn't reposted forever."""
+    decision = {"decision_id": "d10", "channel_id": "1", "question": "q", "options": []}
+    _write_outbox_file("d10.json", decision)
+
+    posted = []
+
+    async def _poster(data):
+        posted.append(data["decision_id"])
+
+    watcher = OutboxWatcher(_poster, interval=999)
+
+    with patch.object(OutboxWatcher, "_move", staticmethod(lambda path, dest: False)):
+        asyncio.run(watcher._tick())
+
+    assert posted == ["d10"]  # it WAS posted
+    assert not (outbox_dir() / "d10.json").exists()  # excluded from next glob
+    assert (outbox_dir() / "d10.json.posted").exists()
+
+    # A second tick must not re-post it.
+    asyncio.run(watcher._tick())
+    assert posted == ["d10"]

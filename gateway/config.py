@@ -631,6 +631,12 @@ class ClaudeBridgeConfig:
     halt_users: List[str] = field(default_factory=list)
     # Extra argv appended to the `claude -p ...` invocation.
     extra_args: List[str] = field(default_factory=list)
+    # Channel IDs the escalation outbox is allowed to post decisions into.
+    # Empty = unrestricted (any channel_id in an outbox file is honored).
+    # Outbox JSON is written by the running claude session itself, not by an
+    # external/untrusted party, but a non-empty allowlist still bounds where
+    # a buggy or compromised prompt could direct a decision post.
+    decision_channels: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -641,6 +647,7 @@ class ClaudeBridgeConfig:
             "timeout_seconds": self.timeout_seconds,
             "halt_users": list(self.halt_users),
             "extra_args": list(self.extra_args),
+            "decision_channels": list(self.decision_channels),
         }
 
     @classmethod
@@ -653,6 +660,9 @@ class ClaudeBridgeConfig:
         extra_args = data.get("extra_args") or []
         if not isinstance(extra_args, list):
             extra_args = []
+        decision_channels = data.get("decision_channels") or []
+        if not isinstance(decision_channels, list):
+            decision_channels = []
         working_dir = data.get("working_dir")
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
@@ -662,6 +672,7 @@ class ClaudeBridgeConfig:
             timeout_seconds=_coerce_int(data.get("timeout_seconds"), 900),
             halt_users=[str(u) for u in halt_users],
             extra_args=[str(a) for a in extra_args],
+            decision_channels=[str(c) for c in decision_channels],
         )
 
 

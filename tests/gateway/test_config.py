@@ -8,6 +8,7 @@ from agent.secret_scope import reset_secret_scope, set_secret_scope
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from gateway.config import (
     ChannelOverride,
+    ClaudeBridgeConfig,
     GatewayConfig,
     HomeChannel,
     Platform,
@@ -288,6 +289,31 @@ class TestStreamingConfig:
         restored = StreamingConfig.from_dict("enabled")
         assert restored.enabled is False
         assert restored.transport == "auto"
+
+
+class TestClaudeBridgeConfig:
+    def test_defaults_are_disabled_and_unrestricted(self):
+        restored = ClaudeBridgeConfig.from_dict({})
+        assert restored.enabled is False
+        assert restored.working_dir is None
+        assert restored.decision_channels == []
+        assert restored.halt_users == []
+
+    def test_roundtrips_decision_channels(self):
+        cfg = ClaudeBridgeConfig(
+            enabled=True, working_dir="/repo", decision_channels=["123", "456"],
+        )
+        restored = ClaudeBridgeConfig.from_dict(cfg.to_dict())
+        assert restored.decision_channels == ["123", "456"]
+
+    def test_non_list_decision_channels_falls_back_to_empty(self):
+        restored = ClaudeBridgeConfig.from_dict({"decision_channels": "not-a-list"})
+        assert restored.decision_channels == []
+
+    def test_from_dict_malformed_section_falls_back_to_defaults(self):
+        restored = ClaudeBridgeConfig.from_dict("oops")
+        assert restored.enabled is False
+        assert restored.decision_channels == []
 
 
 class TestGatewayConfigRoundtrip:
