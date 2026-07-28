@@ -145,12 +145,28 @@ class _SessionMap:
     def set(self, key: str, session_id: str) -> None:
         self._load()
         self._data[key] = session_id
-        _atomic_write_json(self._path, self._data)
+        # A persistence failure here must not discard a spawn that already
+        # succeeded — the in-memory map still has it for this process, and
+        # worst case a future message just starts a fresh claude session
+        # instead of resuming (degraded, not lost).
+        try:
+            _atomic_write_json(self._path, self._data)
+        except Exception:
+            logger.warning(
+                "claude_bridge: failed to persist session map to %s",
+                self._path, exc_info=True,
+            )
 
     def clear(self, key: str) -> None:
         self._load()
         if self._data.pop(key, None) is not None:
-            _atomic_write_json(self._path, self._data)
+            try:
+                _atomic_write_json(self._path, self._data)
+            except Exception:
+                logger.warning(
+                    "claude_bridge: failed to persist session map to %s",
+                    self._path, exc_info=True,
+                )
 
 
 @dataclass
@@ -238,6 +254,15 @@ class ClaudeBridge:
         self._key_locks: Dict[str, asyncio.Lock] = {}
         self._key_locks_guard = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(max(1, config.max_concurrency))
+        # Surface a misconfiguration at startup rather than staying silent
+        # until the first inbound message hits the same check in
+        # handle_message() (F7) — a gateway that never receives a message on
+        # this channel would otherwise never reveal the problem.
+        if config.enabled and not config.working_dir:
+            logger.warning(
+                "claude_bridge.enabled=true but claude_bridge.working_dir is "
+                "unset — every bridged message will fail until it's configured"
+            )
 
     @property
     def enabled(self) -> bool:
@@ -284,13 +309,32 @@ class ClaudeBridge:
         if self._is_halted():
             return "Claude bridge is halted (send !unhalt to resume)."
 
+        # Session-scoped commands the gateway's own agent loop understands
+        # (/new, /reset, /stop) have no meaning to a bare `claude -p` spawn —
+        # without handling them here they'd be sent straight through as a
+        # literal prompt. /new and /reset both mean "forget the stored
+        # session_id, start fresh"; /stop has no bridge equivalent (there is
+        # no in-flight agent turn to interrupt) so it's rejected explicitly
+        # rather than silently becoming a prompt.
+        key = channel_key(event)
+        command = event.get_command()
+        if command in ("new", "reset"):
+            lock = await self._lock_for(key)
+            async with lock:
+                self._sessions.clear(key)
+            return "Started a new Claude session for this channel."
+        if command == "stop":
+            return (
+                "claude_bridge doesn't support /stop — wait for the current "
+                "spawn to finish, or send !halt to stop starting new ones."
+            )
+
         if not self.config.working_dir:
             logger.error(
                 "claude_bridge.enabled=true but claude_bridge.working_dir is unset"
             )
             return "Claude bridge is misconfigured: working_dir is not set."
 
-        key = channel_key(event)
         lock = await self._lock_for(key)
         async with self._semaphore:
             async with lock:
