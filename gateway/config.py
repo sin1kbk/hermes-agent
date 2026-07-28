@@ -612,6 +612,59 @@ class StreamingConfig:
         )
 
 
+@dataclass
+class ClaudeBridgeConfig:
+    """Configuration for routing inbound messages to a spawned Claude Code CLI.
+
+    When ``enabled`` is False (the default), the gateway's normal agent loop
+    handles every message and this config is inert — no behavior difference
+    from before the bridge existed.
+    """
+    enabled: bool = False
+    # cwd for the spawned `claude` process. Required when enabled (validated
+    # by ClaudeBridge, not here, so config loading never raises on this).
+    working_dir: Optional[str] = None
+    claude_bin: str = "claude"
+    max_concurrency: int = 2
+    timeout_seconds: int = 900
+    # User IDs allowed to send !halt / !unhalt. Empty = anyone may.
+    halt_users: List[str] = field(default_factory=list)
+    # Extra argv appended to the `claude -p ...` invocation.
+    extra_args: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "working_dir": self.working_dir,
+            "claude_bin": self.claude_bin,
+            "max_concurrency": self.max_concurrency,
+            "timeout_seconds": self.timeout_seconds,
+            "halt_users": list(self.halt_users),
+            "extra_args": list(self.extra_args),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ClaudeBridgeConfig":
+        if not isinstance(data, dict) or not data:
+            return cls()
+        halt_users = data.get("halt_users") or []
+        if not isinstance(halt_users, list):
+            halt_users = []
+        extra_args = data.get("extra_args") or []
+        if not isinstance(extra_args, list):
+            extra_args = []
+        working_dir = data.get("working_dir")
+        return cls(
+            enabled=_coerce_bool(data.get("enabled"), False),
+            working_dir=str(working_dir) if working_dir else None,
+            claude_bin=data.get("claude_bin") or "claude",
+            max_concurrency=_coerce_int(data.get("max_concurrency"), 2),
+            timeout_seconds=_coerce_int(data.get("timeout_seconds"), 900),
+            halt_users=[str(u) for u in halt_users],
+            extra_args=[str(a) for a in extra_args],
+        )
+
+
 # -----------------------------------------------------------------------------
 # Built-in platform connection checkers
 # -----------------------------------------------------------------------------
@@ -713,6 +766,9 @@ class GatewayConfig:
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
+
+    # Claude Code CLI bridge (opt-in; default off preserves the built-in agent loop).
+    claude_bridge: ClaudeBridgeConfig = field(default_factory=ClaudeBridgeConfig)
 
     # Session store pruning: drop SessionEntry records older than this many
     # days from the in-memory dict and sessions.json.  Keeps the store from
@@ -827,6 +883,7 @@ class GatewayConfig:
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
+            "claude_bridge": self.claude_bridge.to_dict(),
         }
     
     @classmethod
@@ -941,6 +998,7 @@ class GatewayConfig:
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
+            claude_bridge=ClaudeBridgeConfig.from_dict(data.get("claude_bridge", {})),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -1075,6 +1133,18 @@ def load_gateway_config() -> GatewayConfig:
                 )
             if isinstance(streaming_cfg, dict):
                 gw_data["streaming"] = streaming_cfg
+
+            claude_bridge_cfg = yaml_cfg.get("claude_bridge")
+            if not isinstance(claude_bridge_cfg, dict):
+                # Fall back to nested gateway.claude_bridge written by
+                # ``hermes config set gateway.claude_bridge.*``
+                claude_bridge_cfg = (
+                    gateway_cfg.get("claude_bridge")
+                    if isinstance(gateway_cfg, dict)
+                    else None
+                )
+            if isinstance(claude_bridge_cfg, dict):
+                gw_data["claude_bridge"] = claude_bridge_cfg
 
             if "reset_triggers" in yaml_cfg:
                 gw_data["reset_triggers"] = yaml_cfg["reset_triggers"]
