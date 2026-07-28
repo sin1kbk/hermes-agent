@@ -2807,6 +2807,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # bridge to exercise unrelated methods via ``_select_message_handler()``.
     claude_bridge: "ClaudeBridge" = ClaudeBridge(ClaudeBridgeConfig())
     _claude_bridge_outbox_watcher: Optional["OutboxWatcher"] = None
+    _claude_bridge_outbox_watcher_task: Optional[asyncio.Task] = None
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -2822,6 +2823,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.claude_bridge = ClaudeBridge(self.config.claude_bridge)
         self._claude_bridge_outbox_watcher: Optional[OutboxWatcher] = None
+        self._claude_bridge_outbox_watcher_task: Optional[asyncio.Task] = None
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
@@ -7411,11 +7413,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # engages drain on the first tick.
         asyncio.create_task(self._drain_control_watcher())
 
-        # Start the Claude bridge escalation-outbox watcher. Only meaningful
-        # once a platform that knows how to render decision buttons is
-        # connected — currently Discord only.
-        if self.claude_bridge.enabled:
-            self._start_claude_bridge_outbox_watcher()
+        # Start the Claude bridge escalation-outbox watcher. Idempotent and
+        # self-gated on claude_bridge.enabled — also called from the platform
+        # reconnect watcher and the multiplex connect path (F1) so a bridge
+        # enabled before Discord's first successful connect still gets one.
+        self._start_claude_bridge_outbox_watcher()
 
         logger.info("Press Ctrl+C to stop")
         
@@ -7956,6 +7958,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             logger.debug(
                                 "resume-pending reschedule after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
+
+                        # Discord may be the platform that just reconnected —
+                        # give the Claude bridge escalation watcher another
+                        # chance to start if it hasn't yet (F1). Idempotent.
+                        try:
+                            self._start_claude_bridge_outbox_watcher(adapter)
+                        except Exception:
+                            logger.debug(
+                                "claude_bridge outbox watcher start after %s reconnect failed",
                                 platform.value,
                                 exc_info=True,
                             )
@@ -8633,6 +8647,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     profile_map[platform] = adapter
                     connected += 1
                     logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
+                    # Secondary-profile Discord adapters live in profile_map,
+                    # never in self.adapters — give the escalation watcher a
+                    # chance to start from here too (F1). Idempotent.
+                    try:
+                        self._start_claude_bridge_outbox_watcher(adapter)
+                    except Exception:
+                        logger.debug(
+                            "claude_bridge outbox watcher start after profile "
+                            "'%s' %s connect failed",
+                            profile_name, platform.value,
+                            exc_info=True,
+                        )
                 else:
                     logger.warning("✗ %s failed to connect (profile: %s)", platform.value, profile_name)
                     await self._safe_adapter_disconnect(adapter, platform)
@@ -8872,30 +8898,154 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplex per-profile wrapper) routes through here so the Claude
         bridge opt-in has exactly one switch. ``claude_bridge.enabled=False``
         (the default) always returns ``self._handle_message`` unchanged.
+        ``_claude_bridge_handler`` (not ``self.claude_bridge.handle_message``
+        directly) applies the same pairing/allowlist gate as
+        ``_handle_message`` — see ``_gate_unauthorized_message``.
         """
         if self.claude_bridge.enabled:
-            return self.claude_bridge.handle_message
+            return self._claude_bridge_handler
         return self._handle_message
 
-    def _start_claude_bridge_outbox_watcher(self) -> None:
-        """Start the Claude bridge escalation watcher if a poster platform is up.
+    def _start_claude_bridge_outbox_watcher(self, adapter: Optional[Any] = None) -> None:
+        """Start the Claude bridge escalation-outbox watcher, once.
+
+        Idempotent and safe to call opportunistically from anywhere an
+        adapter just came online — initial startup, the failed-platform
+        reconnect watcher, and the multiplex secondary-profile connect path
+        all call this on every successful connect (F1). Discord may not be
+        connected yet the first time this runs (e.g. it's the platform that
+        failed and is retrying), so without those extra call sites the
+        watcher would stay off for the gateway's entire lifetime.
 
         Discord is the only platform with a decision-button ``View`` today
-        (``DiscordAdapter.post_claude_bridge_decision``). No-ops quietly when
-        Discord isn't connected — the bridge's normal message handling still
-        works, it just has no channel to post escalation decisions into.
+        (``DiscordAdapter.post_claude_bridge_decision``); ``adapter`` lets
+        callers pass the adapter that just connected directly instead of
+        re-deriving it, and non-Discord adapters are simply ignored (no
+        ``post_claude_bridge_decision`` attribute).
         """
-        discord_adapter = self.adapters.get(Platform.DISCORD)
-        poster = getattr(discord_adapter, "post_claude_bridge_decision", None)
-        if poster is None:
-            logger.info(
-                "claude_bridge: enabled but no platform can render decision "
-                "buttons yet (Discord not connected) — escalation outbox idle"
-            )
+        if not self.claude_bridge.enabled or self._claude_bridge_outbox_watcher is not None:
             return
-        self._claude_bridge_outbox_watcher = OutboxWatcher(poster)
-        asyncio.create_task(self._claude_bridge_outbox_watcher.run())
+        if adapter is None:
+            adapter = self.adapters.get(Platform.DISCORD)
+        poster = getattr(adapter, "post_claude_bridge_decision", None)
+        if poster is None:
+            return
+
+        self._claude_bridge_outbox_watcher = OutboxWatcher(
+            poster, allowed_channels=self.claude_bridge.config.decision_channels,
+        )
+        task = asyncio.create_task(self._claude_bridge_outbox_watcher.run())
+        # Hold a strong reference — asyncio.create_task() only keeps a weak
+        # one, so an unreferenced task can be GC'd mid-run (see the
+        # _restart_task comment on the same pattern).
+        self._claude_bridge_outbox_watcher_task = task
+
+        def _on_watcher_done(t: "asyncio.Task") -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.error(
+                    "claude_bridge: escalation outbox watcher died: %s", exc, exc_info=exc,
+                )
+
+        task.add_done_callback(_on_watcher_done)
         logger.info("claude_bridge: escalation outbox watcher started (discord)")
+
+    async def _gate_unauthorized_message(
+        self, event: MessageEvent, is_internal: Optional[bool] = None,
+    ) -> bool:
+        """Enforce the pairing/allowlist gate every message path must pass.
+
+        Returns True when ``event`` may proceed to whatever handles it next
+        (authorized, or an internal/system event that bypasses auth
+        entirely). Returns False when the sender is unauthorized — this
+        method has already fully handled that case itself (DM: pairing-code
+        offer with per-sender rate limiting; group: silent drop; no
+        user_id: debug log) and the caller must stop and return None without
+        doing anything else.
+
+        Single source of truth for "an unpaired sender's message must not
+        reach any handler" — both ``_handle_message`` and the Claude bridge
+        wrapper (``_claude_bridge_handler``) route through this so bridge
+        mode can't bypass pairing/allowlist enforcement just because
+        ``ClaudeBridge`` itself has no notion of gateway auth state.
+        """
+        source = event.source
+        if is_internal is None:
+            is_internal = bool(getattr(event, "internal", False))
+        if is_internal:
+            return True
+
+        if source.user_id is None:
+            # Messages with no user identity (Telegram service messages,
+            # channel forwards, anonymous admin posts, sender_chat) can't
+            # be paired, but they can still be authorized via a
+            # chat-scoped allowlist (e.g. TELEGRAM_GROUP_ALLOWED_CHATS
+            # authorizes every member of the listed chat regardless of
+            # sender). Defer to _is_user_authorized so that path runs.
+            if not self._is_user_authorized(source):
+                logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                return False
+            return True
+
+        if self._is_user_authorized(source):
+            return True
+
+        logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+        # In DMs: offer pairing code. In groups: silently ignore.
+        if (
+            source.chat_type == "dm"
+            and self._get_unauthorized_dm_behavior(
+                source.platform,
+                profile=source.profile,
+            )
+            == "pair"
+        ):
+            platform_name = source.platform.value if source.platform else "unknown"
+            # Rate-limit ALL pairing responses (code or rejection) to
+            # prevent spamming the user with repeated messages when
+            # multiple DMs arrive in quick succession.
+            if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                return False
+            code = self.pairing_store.generate_code(
+                platform_name, source.user_id, source.user_name or ""
+            )
+            if code:
+                adapter = self._adapter_for_source(source)
+                if adapter:
+                    await adapter.send(
+                        source.chat_id,
+                        f"Hi~ I don't recognize you yet!\n\n"
+                        f"Here's your pairing code: `{code}`\n\n"
+                        f"Ask the bot owner to run:\n"
+                        f"`hermes pairing approve {platform_name} {code}`"
+                    )
+            else:
+                adapter = self._adapter_for_source(source)
+                if adapter:
+                    await adapter.send(
+                        source.chat_id,
+                        "Too many pairing requests right now~ "
+                        "Please try again later!"
+                    )
+                # Record rate limit so subsequent messages are silently ignored
+                self.pairing_store._record_rate_limit(platform_name, source.user_id)
+        return False
+
+    async def _claude_bridge_handler(self, event: MessageEvent) -> Optional[str]:
+        """Authorization-gated entry point used when the Claude bridge is on.
+
+        ``ClaudeBridge.handle_message`` is deliberately platform/auth-agnostic
+        (no ``GatewayRunner`` reference — see gateway/claude_bridge.py) so it
+        never checks pairing/allowlist state on its own. This wrapper is what
+        makes that safe: it applies the exact same gate ``_handle_message``
+        does before handing off, so bridge mode can't be used to reach
+        ``claude -p`` as an unpaired sender.
+        """
+        if not await self._gate_unauthorized_message(event):
+            return None
+        return await self.claude_bridge.handle_message(event)
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -8990,60 +9140,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
-        if is_internal:
-            pass
-        elif source.user_id is None:
-            # Messages with no user identity (Telegram service messages,
-            # channel forwards, anonymous admin posts, sender_chat) can't
-            # be paired, but they can still be authorized via a
-            # chat-scoped allowlist (e.g. TELEGRAM_GROUP_ALLOWED_CHATS
-            # authorizes every member of the listed chat regardless of
-            # sender). Defer to _is_user_authorized so that path runs.
-            if not self._is_user_authorized(source):
-                logger.debug("Ignoring message with no user_id from %s", source.platform.value)
-                return None
-        elif not self._is_user_authorized(source):
-            logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
-            if (
-                source.chat_type == "dm"
-                and self._get_unauthorized_dm_behavior(
-                    source.platform,
-                    profile=source.profile,
-                )
-                == "pair"
-            ):
-                platform_name = source.platform.value if source.platform else "unknown"
-                # Rate-limit ALL pairing responses (code or rejection) to
-                # prevent spamming the user with repeated messages when
-                # multiple DMs arrive in quick succession.
-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
-                    return None
-                code = self.pairing_store.generate_code(
-                    platform_name, source.user_id, source.user_name or ""
-                )
-                if code:
-                    adapter = self._adapter_for_source(source)
-                    if adapter:
-                        await adapter.send(
-                            source.chat_id,
-                            f"Hi~ I don't recognize you yet!\n\n"
-                            f"Here's your pairing code: `{code}`\n\n"
-                            f"Ask the bot owner to run:\n"
-                            f"`hermes pairing approve {platform_name} {code}`"
-                        )
-                else:
-                    adapter = self._adapter_for_source(source)
-                    if adapter:
-                        await adapter.send(
-                            source.chat_id,
-                            "Too many pairing requests right now~ "
-                            "Please try again later!"
-                        )
-                    # Record rate limit so subsequent messages are silently ignored
-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
+        if not await self._gate_unauthorized_message(event, is_internal=is_internal):
             return None
-        
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via

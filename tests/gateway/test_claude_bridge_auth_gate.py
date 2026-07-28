@@ -1,0 +1,122 @@
+"""Regression tests for C1: the Claude bridge must not bypass the gateway's
+pairing/allowlist gate.
+
+Before this fix, ``_select_message_handler()`` routed bridge-enabled
+gateways straight to ``ClaudeBridge.handle_message`` (which has no notion of
+gateway auth state), skipping the unauthorized-sender handling that
+``_handle_message`` applies. An unpaired sender could reach ``claude -p``.
+"""
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.claude_bridge import ClaudeBridge
+from gateway.config import ClaudeBridgeConfig, Platform
+from gateway.platforms.base import MessageEvent
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+
+
+def _event(text="hello claude", user_id="user1", chat_type="dm", chat_id="c1"):
+    return MessageEvent(
+        text=text,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            user_id=user_id,
+        ),
+    )
+
+
+def _make_runner(authorized_users=frozenset({"user1"})):
+    """Minimal GatewayRunner double, mirroring the pattern used by
+    tests/gateway/test_busy_session_auth_bypass.py."""
+    runner = object.__new__(GatewayRunner)
+    runner.config = MagicMock()
+    runner._is_user_authorized = lambda source: source.user_id in authorized_users
+    runner._get_unauthorized_dm_behavior = lambda *a, **k: "pair"
+    runner.pairing_store = MagicMock()
+    runner.pairing_store._is_rate_limited.return_value = False
+    runner.pairing_store.generate_code.return_value = "ABC123"
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner._adapter_for_source = lambda source: adapter
+    runner.claude_bridge = ClaudeBridge(ClaudeBridgeConfig(enabled=True, working_dir="/tmp"))
+    return runner, adapter
+
+
+class TestGateUnauthorizedMessage:
+    @pytest.mark.asyncio
+    async def test_authorized_user_passes(self):
+        runner, _adapter = _make_runner()
+        assert await runner._gate_unauthorized_message(_event(user_id="user1")) is True
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_dm_blocked_and_offered_pairing(self):
+        runner, adapter = _make_runner()
+        allowed = await runner._gate_unauthorized_message(_event(user_id="stranger"))
+        assert allowed is False
+        adapter.send.assert_awaited_once()
+        assert "pairing code" in adapter.send.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_group_blocked_silently(self):
+        runner, adapter = _make_runner()
+        allowed = await runner._gate_unauthorized_message(
+            _event(user_id="stranger", chat_type="group")
+        )
+        assert allowed is False
+        adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_internal_event_bypasses_gate(self):
+        runner, adapter = _make_runner()
+        event = _event(user_id="stranger")
+        event.internal = True
+        assert await runner._gate_unauthorized_message(event) is True
+        adapter.send.assert_not_awaited()
+
+
+class TestClaudeBridgeHandlerAuthorization:
+    @pytest.mark.asyncio
+    async def test_unauthorized_sender_never_reaches_claude_bridge(self):
+        runner, adapter = _make_runner()
+        called = False
+
+        async def _fail_handle(event):
+            nonlocal called
+            called = True
+            raise AssertionError("must not spawn claude for an unauthorized sender")
+
+        runner.claude_bridge.handle_message = _fail_handle
+
+        reply = await runner._claude_bridge_handler(_event(user_id="stranger"))
+
+        assert reply is None
+        assert called is False
+        adapter.send.assert_awaited_once()  # pairing code offered instead
+
+    @pytest.mark.asyncio
+    async def test_authorized_sender_reaches_claude_bridge(self):
+        runner, _adapter = _make_runner()
+        seen = []
+
+        async def _fake_handle(event):
+            seen.append(event.text)
+            return "ok from claude"
+
+        runner.claude_bridge.handle_message = _fake_handle
+
+        reply = await runner._claude_bridge_handler(_event(user_id="user1", text="hi"))
+
+        assert reply == "ok from claude"
+        assert seen == ["hi"]
+
+    @pytest.mark.asyncio
+    async def test_select_message_handler_routes_through_auth_gate_when_enabled(self):
+        runner, _adapter = _make_runner()
+        handler = runner._select_message_handler()
+        assert handler == runner._claude_bridge_handler
+        assert handler != runner.claude_bridge.handle_message
