@@ -171,12 +171,18 @@ async def _spawn_claude(
 ) -> _SpawnOutcome:
     """Spawn ``claude -p`` and parse its JSON output.
 
+    The prompt is passed via stdin, never as an argv element: a Discord
+    message that happens to start with ``-`` would otherwise be parsed as a
+    CLI flag by ``claude`` (argv injection), and ARG_MAX caps how much text
+    can go through argv at all. ``claude -p`` (no positional prompt
+    argument) reads the prompt from stdin.
+
     Every failure mode (spawn error, non-zero exit, timeout, unparseable
     output) is reported via ``_SpawnOutcome.error`` rather than raised, so
     the caller always has a user-facing message to return — silent failure
     is not an option for a chat-facing bridge.
     """
-    args = [claude_bin, "-p", prompt, "--output-format", "json"]
+    args = [claude_bin, "-p", "--output-format", "json"]
     if resume_session_id:
         args += ["--resume", resume_session_id]
     args += list(extra_args)
@@ -185,6 +191,7 @@ async def _spawn_claude(
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=working_dir,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -193,7 +200,7 @@ async def _spawn_claude(
 
     try:
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_seconds,
+            proc.communicate(input=prompt.encode("utf-8")), timeout=timeout_seconds,
         )
     except asyncio.TimeoutError:
         proc.kill()

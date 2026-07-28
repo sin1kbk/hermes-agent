@@ -35,8 +35,10 @@ class _FakeProc:
         self.returncode = returncode
         self._hang = hang
         self.killed = False
+        self.stdin_received = None
 
-    async def communicate(self):
+    async def communicate(self, input=None):
+        self.stdin_received = input
         if self._hang:
             await asyncio.sleep(60)
         return self._stdout, self._stderr
@@ -153,6 +155,31 @@ def test_resume_uses_resume_flag(monkeypatch, tmp_path):
     assert "--resume" in called_args
     assert "sess-1" in called_args
     assert "--foo" in called_args
+
+
+def test_prompt_is_sent_via_stdin_not_argv(monkeypatch, tmp_path):
+    """C2: argv injection / ARG_MAX — the prompt must never appear in argv."""
+    payload = {"result": "ok", "session_id": "sess-1", "is_error": False}
+    fake = _FakeProc(stdout=json.dumps(payload).encode())
+    exec_mock = AsyncMock(return_value=fake)
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", exec_mock)
+
+    prompt = "-rf --dangerous a Discord message that looks like CLI flags"
+    asyncio.run(
+        _spawn_claude(
+            claude_bin="claude", working_dir=str(tmp_path), prompt=prompt,
+            resume_session_id=None, extra_args=[], timeout_seconds=5,
+        )
+    )
+
+    called_args = exec_mock.call_args.args
+    assert prompt not in called_args
+    assert all(prompt not in str(a) for a in called_args)
+    assert fake.stdin_received == prompt.encode("utf-8")
+
+    # `claude -p` (no positional prompt argument) reads from stdin.
+    kwargs = exec_mock.call_args.kwargs
+    assert kwargs.get("stdin") is not None
 
 
 def test_resume_failure_falls_back_to_fresh_spawn(monkeypatch, hermes_home):
