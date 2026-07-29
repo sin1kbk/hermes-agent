@@ -130,6 +130,13 @@ def parse_channel_key(key: str) -> tuple[str, Optional[str], Optional[str]]:
     return platform, chat_id, thread_id
 
 
+def _event_user_id(event: MessageEvent) -> str:
+    """Sender ID for audit logging; ``-`` when the platform omits one."""
+    source = getattr(event, "source", None)
+    user_id = getattr(source, "user_id", None) if source is not None else None
+    return str(user_id) if user_id else "-"
+
+
 class _SessionMap:
     """Persists the channel-key -> claude session_id map as JSON."""
 
@@ -514,6 +521,10 @@ class ClaudeBridge:
         self._key_locks_guard = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(max(1, config.max_concurrency))
         self._procs: Dict[str, _ClaudeProcess] = {}
+        # Per-channel `--permission-mode` overrides set by /mode.  Deliberately
+        # in-memory: a gateway restart returns every channel to the configured
+        # default instead of silently resuming a widened mode.
+        self._mode_overrides: Dict[str, str] = {}
         self._turns_in_progress: set[str] = set()
         self._stop_requested_keys: set[str] = set()
         self._idle_reaper_task: Optional[asyncio.Task] = None
@@ -528,6 +539,20 @@ class ClaudeBridge:
             logger.warning(
                 "claude_bridge.enabled=true but claude_bridge.working_dir is "
                 "unset — every bridged message will fail until it's configured"
+            )
+        # halt_users is fail-open by design (an empty list lets anyone stop the
+        # bridge), but /mode reuses it to *widen* permissions.  Surface the one
+        # combination where that inversion has teeth.
+        if (
+            config.enabled
+            and not config.halt_users
+            and "bypassPermissions" in self._allowed_modes()
+        ):
+            logger.warning(
+                "claude_bridge: /mode can raise a channel to bypassPermissions "
+                "and claude_bridge.halt_users is empty, so any paired sender "
+                "may do it — set halt_users, or drop bypassPermissions from "
+                "allowed_permission_modes"
             )
 
     @property
@@ -595,6 +620,15 @@ class ClaudeBridge:
 
     def _is_halted(self) -> bool:
         return halt_flag_file().exists()
+
+    def _effective_mode(self, key: str) -> str:
+        return self._mode_overrides.get(key, self.config.default_permission_mode)
+
+    def _allowed_modes(self) -> List[str]:
+        allowed = list(self.config.allowed_permission_modes)
+        if self.config.default_permission_mode not in allowed:
+            allowed.append(self.config.default_permission_mode)
+        return allowed
 
     def _is_halt_authorized(self, event: MessageEvent) -> bool:
         if not self.config.halt_users:
@@ -673,7 +707,16 @@ class ClaudeBridge:
             claude_bin=self.config.claude_bin,
             working_dir=self.config.working_dir,
             resume_session_id=resume_session_id,
-            extra_args=self.config.extra_args,
+            # The mode is read at spawn time, not cached on the process, so a
+            # respawn after /mode or an idle reap picks up the current value.
+            # It trails extra_args because the CLI honors the last occurrence:
+            # a --permission-mode written into extra_args must not outrank the
+            # runtime state.
+            extra_args=[
+                *self.config.extra_args,
+                "--permission-mode",
+                self._effective_mode(key),
+            ],
             on_unsolicited_result=(
                 lambda event, key=key: self._handle_unsolicited_result(key, event)
             ),
@@ -767,7 +810,16 @@ class ClaudeBridge:
             async with lock:
                 await self._discard_process(key)
                 self._sessions.clear(key)
-            return "Started a new Claude session for this channel."
+                # A fresh session starts from the configured mode: keeping a
+                # widened override alive across /new would outlive the task it
+                # was granted for.
+                self._mode_overrides.pop(key, None)
+            return (
+                "Started a new Claude session for this channel "
+                f"(permission mode {self.config.default_permission_mode})."
+            )
+        if command == "mode":
+            return await self._handle_mode_command(event, key)
         if command == "stop":
             if key in self._turns_in_progress:
                 self._stop_requested_keys.add(key)
@@ -784,6 +836,77 @@ class ClaudeBridge:
         async with self._semaphore:
             async with lock:
                 return await self._handle_locked(key, text)
+
+    async def _handle_mode_command(self, event: MessageEvent, key: str) -> str:
+        """``/mode [name|default]`` — read or switch this channel's mode.
+
+        Matching is case-insensitive: the CLI's mode names are camelCase and
+        mobile keyboards capitalize a leading word.
+        """
+        allowed = self._allowed_modes()
+        requested = event.get_command_args().strip()
+        if not requested:
+            return (
+                f"Permission mode: {self._effective_mode(key)} "
+                f"(default {self.config.default_permission_mode}). "
+                f"Switch with /mode <{' | '.join(allowed)}>, or /mode default."
+            )
+        # Every attempt to widen the mode is logged with its sender: this
+        # command is reachable from a chat client, so the server log is the
+        # only audit trail of who changed it.
+        user_id = _event_user_id(event)
+        if not self._is_halt_authorized(event):
+            logger.warning(
+                "claude_bridge: rejected unauthorized /mode %r from %s in %s",
+                requested[:40],
+                user_id,
+                key,
+            )
+            return "Not authorized to change the Claude permission mode."
+
+        canonical = {mode.lower(): mode for mode in allowed}
+        if requested.lower() in ("default", "reset"):
+            target = None
+        elif requested.lower() in canonical:
+            target = canonical[requested.lower()]
+        else:
+            logger.warning(
+                "claude_bridge: rejected /mode %r from %s in %s (not allowed)",
+                requested[:40],
+                user_id,
+                key,
+            )
+            return (
+                f"Unknown permission mode: {requested}. "
+                f"Allowed: {' | '.join(allowed)}, or default."
+            )
+
+        lock = await self._lock_for(key)
+        async with lock:
+            previous = self._effective_mode(key)
+            if target is None:
+                self._mode_overrides.pop(key, None)
+            else:
+                self._mode_overrides[key] = target
+            effective = self._effective_mode(key)
+            # The mode is a spawn flag, so a resident process keeps the old one
+            # until it is replaced.  Its session ID is left in place, so the
+            # next turn resumes the same conversation under the new mode.  A
+            # request that lands on the mode already in effect replaces
+            # nothing, so the process is left alive.
+            if effective != previous:
+                await self._discard_process(key)
+        logger.info(
+            "claude_bridge: %s set permission mode for %s to %s",
+            user_id,
+            key,
+            effective,
+        )
+        return (
+            f"Permission mode for this channel is now {effective}, starting with "
+            f"the next message. A gateway restart returns it to "
+            f"{self.config.default_permission_mode}."
+        )
 
     async def _handle_locked(self, key: str, text: str) -> str:
         resume_id = self._sessions.get(key)
