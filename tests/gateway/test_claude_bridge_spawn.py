@@ -372,3 +372,144 @@ async def test_idle_process_is_reaped_without_clearing_session(monkeypatch, herm
     assert "discord:c1" not in bridge._procs
     assert bridge._sessions.get("discord:c1") == "saved-session"
     await bridge.close()
+
+
+def _unsolicited(text, session_id="sess-1", kind="task-notification"):
+    """A result from a turn the CLI ran itself (e.g. a background task ended)."""
+    return (json.dumps({"type": "result", "result": text, "session_id": session_id,
+                        "is_error": False, "origin": {"kind": kind}}) + "\n").encode("utf-8")
+
+
+async def _settle():
+    """Let the stdout drainer and any notice task run to completion."""
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+
+def _collecting_bridge(home, notices, **overrides):
+    bridge = _bridge(home, **overrides)
+
+    async def _notify(key, text):
+        notices.append((key, text))
+
+    bridge.set_notifier(_notify)
+    return bridge
+
+
+@pytest.mark.asyncio
+async def test_unsolicited_result_never_answers_the_next_message(monkeypatch, hermes_home):
+    """The regression: a background task's turn emits a second result with
+    nobody waiting for it.  Handing that to the next message is what made
+    every later reply answer an earlier one."""
+    proc = _FakeProc(responses=[[_result("reply to one")], [_result("reply to two")]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    notices = []
+    bridge = _collecting_bridge(hermes_home, notices)
+
+    assert await bridge.handle_message(_event("one")) == "reply to one"
+    proc.stdout.feed_lines([_unsolicited("background task finished")])
+    await _settle()
+
+    assert await bridge.handle_message(_event("two")) == "reply to two"
+    assert notices == [("discord:c1", "background task finished")]
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_origin_kind_is_treated_as_unsolicited(monkeypatch, hermes_home):
+    """A self-started turn type we have never seen must not steal a reply."""
+    proc = _FakeProc(responses=[[_result("reply to one")], [_result("reply to two")]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    notices = []
+    bridge = _collecting_bridge(hermes_home, notices)
+
+    await bridge.handle_message(_event("one"))
+    proc.stdout.feed_lines([_unsolicited("something new", kind="some-future-trigger")])
+    await _settle()
+
+    assert await bridge.handle_message(_event("two")) == "reply to two"
+    assert notices == [("discord:c1", "something new")]
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_result_marked_as_ours_still_answers_the_turn(monkeypatch, hermes_home):
+    """``origin.kind`` naming the stdin prompt stays our own turn's answer."""
+    line = (json.dumps({"type": "result", "result": "mine", "session_id": "s1",
+                        "is_error": False, "origin": {"kind": "user"}}) + "\n").encode("utf-8")
+    proc = _FakeProc(responses=[[line]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    notices = []
+    bridge = _collecting_bridge(hermes_home, notices)
+
+    assert await bridge.handle_message(_event("one")) == "mine"
+    assert notices == []
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_stray_result_with_no_waiter_is_dropped_not_carried_over(monkeypatch, hermes_home):
+    """Self-healing: even a result we cannot attribute is dropped rather than
+    left to shift the next reply."""
+    proc = _FakeProc(responses=[[_result("reply to one")], [_result("reply to two")]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    notices = []
+    bridge = _collecting_bridge(hermes_home, notices)
+
+    await bridge.handle_message(_event("one"))
+    proc.stdout.feed_lines([_result("stray with no origin")])
+    await _settle()
+
+    assert await bridge.handle_message(_event("two")) == "reply to two"
+    assert notices == []
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_notifier_failure_does_not_break_the_next_turn(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("reply to one")], [_result("reply to two")]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    bridge = _bridge(hermes_home)
+    bridge.set_notifier(AsyncMock(side_effect=RuntimeError("delivery exploded")))
+
+    await bridge.handle_message(_event("one"))
+    proc.stdout.feed_lines([_unsolicited("background task finished")])
+    await _settle()
+
+    assert await bridge.handle_message(_event("two")) == "reply to two"
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_unsolicited_result_keeps_the_session_id_current(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("reply to one", "sess-a")]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    notices = []
+    bridge = _collecting_bridge(hermes_home, notices)
+
+    await bridge.handle_message(_event("one"))
+    proc.stdout.feed_lines([_unsolicited("done", session_id="sess-b")])
+    await _settle()
+
+    assert bridge._sessions.get("discord:c1") == "sess-b"
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_error_and_empty_unsolicited_results_are_not_posted(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("reply to one")]])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+    notices = []
+    bridge = _collecting_bridge(hermes_home, notices)
+
+    await bridge.handle_message(_event("one"))
+    failed = json.loads(_unsolicited("boom").decode())
+    failed["is_error"] = True
+    proc.stdout.feed_lines([
+        (json.dumps(failed) + "\n").encode("utf-8"),
+        _unsolicited("   "),
+    ])
+    await _settle()
+
+    assert notices == []
+    await bridge.close()

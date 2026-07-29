@@ -117,6 +117,19 @@ def channel_key(event: MessageEvent) -> str:
     return ":".join(parts)
 
 
+def parse_channel_key(key: str) -> tuple[str, Optional[str], Optional[str]]:
+    """Inverse of ``channel_key``: ``(platform, chat_id, thread_id)``.
+
+    Used to address a channel that no inbound message is pointing at — a turn
+    the CLI ran by itself has no message to reply to.
+    """
+    parts = key.split(":")
+    platform = parts[0] if parts else ""
+    chat_id = parts[1] if len(parts) > 1 and parts[1] not in ("", "-") else None
+    thread_id = parts[2] if len(parts) > 2 and parts[2] not in ("", "-") else None
+    return platform, chat_id, thread_id
+
+
 class _SessionMap:
     """Persists the channel-key -> claude session_id map as JSON."""
 
@@ -187,9 +200,24 @@ class _ClaudeProcess:
     never argv.  Besides avoiding argv injection from messages beginning with
     ``-``, this avoids the operating system's argv-size limit for large chat
     messages.
+
+    Not every turn the CLI runs was asked for over stdin: a completed
+    background task makes it run one on its own and emit a second ``result``.
+    Those results carry an ``origin`` field, ours carry none, and stdout is
+    drained continuously so an unsolicited result is routed away from the
+    turn waiting for its own answer instead of being handed to it.
     """
 
     _STDERR_TAIL_BYTES = 4 * 1024
+    # How long to wait for a child that closed stdout to actually exit.  The
+    # reap happens on the drainer, outside any turn's timeout, so an unbounded
+    # wait here would strand the turn until its own (much longer) deadline.
+    _EOF_REAP_TIMEOUT = 5
+    # ``origin.kind`` values that still mean "this answers the prompt we put
+    # on stdin".  Anything else — today only ``task-notification`` — is a turn
+    # the CLI started by itself.  Unknown kinds are treated as unsolicited so
+    # a future self-started turn type cannot silently steal a reply.
+    _SELF_ORIGIN_KINDS = frozenset({"user", "prompt", "stdin", "cli"})
 
     def __init__(
         self,
@@ -198,22 +226,33 @@ class _ClaudeProcess:
         working_dir: str,
         resume_session_id: Optional[str],
         extra_args: List[str],
+        on_unsolicited_result: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self._claude_bin = claude_bin
         self._working_dir = working_dir
         self._resume_session_id = resume_session_id
         self._extra_args = list(extra_args)
+        self._on_unsolicited_result = on_unsolicited_result
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        self._stdout_task: Optional[asyncio.Task] = None
         self._stderr_tail = ""
         self._completed_result_count = 0
+        self._turn_waiter: Optional[asyncio.Future] = None
         self.last_used = time.monotonic()
         self.is_turn_active = False
         self.intentional_stop = False
 
     @property
     def is_alive(self) -> bool:
-        return self.proc is not None and self.proc.returncode is None
+        """Usable for a turn: the child runs *and* something still reads it.
+
+        A dead drainer means nothing will ever resolve a turn's waiter, so a
+        process in that state is retired and respawned rather than written to.
+        """
+        if self.proc is None or self.proc.returncode is not None:
+            return False
+        return self._stdout_task is None or not self._stdout_task.done()
 
     @property
     def is_unproven_resume(self) -> bool:
@@ -251,6 +290,12 @@ class _ClaudeProcess:
         self._stderr_task = asyncio.create_task(
             self._drain_stderr(), name="claude-bridge-stderr"
         )
+        # stdout is drained even between turns: an unsolicited turn's events
+        # would otherwise sit unread until the next message, and its result
+        # would be the first thing that message's read saw.
+        self._stdout_task = asyncio.create_task(
+            self._drain_stdout(), name="claude-bridge-stdout"
+        )
         return None
 
     async def _drain_stderr(self) -> None:
@@ -277,7 +322,7 @@ class _ClaudeProcess:
         return self._stderr_tail.strip() or "(no stderr)"
 
     async def send_turn(self, prompt: str, timeout_seconds: int) -> _SpawnOutcome:
-        """Write one user event and wait for its terminating result event."""
+        """Write one user event and wait for the result event that answers it."""
         if not self.is_alive or self.proc is None or self.proc.stdin is None:
             return _SpawnOutcome(error="claude process is not running")
         if self.intentional_stop:
@@ -293,12 +338,14 @@ class _ClaudeProcess:
         payload = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
             "utf-8"
         )
+        waiter: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._turn_waiter = waiter
         self.is_turn_active = True
         self.last_used = time.monotonic()
         try:
             self.proc.stdin.write(payload)
             await asyncio.wait_for(self.proc.stdin.drain(), timeout=timeout_seconds)
-            return await asyncio.wait_for(self._read_result(), timeout=timeout_seconds)
+            return await asyncio.wait_for(waiter, timeout=timeout_seconds)
         except asyncio.TimeoutError:
             await self.terminate()
             return _SpawnOutcome(
@@ -310,49 +357,112 @@ class _ClaudeProcess:
             await self.terminate()
             return _SpawnOutcome(error=f"claude stream failed: {exc}")
         finally:
+            # Cleared even when the awaiting task is cancelled outright, so a
+            # late result can never be delivered to an abandoned turn.
+            if self._turn_waiter is waiter:
+                self._turn_waiter = None
             self.is_turn_active = False
             self.last_used = time.monotonic()
 
-    async def _read_result(self) -> _SpawnOutcome:
+    async def _drain_stdout(self) -> None:
+        """Read stream-json events for the process's whole life, not per turn."""
         if self.proc is None or self.proc.stdout is None:
-            return _SpawnOutcome(error="claude process has no stdout stream")
+            self._resolve_turn(_SpawnOutcome(error="claude process has no stdout stream"))
+            return
+        try:
+            while True:
+                line = await self.proc.stdout.readline()
+                if not line:
+                    await self._handle_stdout_eof()
+                    return
+                self._consume_line(line)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("claude_bridge: stdout drain failed", exc_info=True)
+            self._resolve_turn(_SpawnOutcome(error=f"claude stream failed: {exc}"))
 
-        while True:
-            line = await self.proc.stdout.readline()
-            if not line:
-                if self.intentional_stop:
-                    return _SpawnOutcome(error="Claude turn was stopped", interrupted=True)
-                # Give the always-running stderr task one event-loop turn to
-                # consume bytes that arrived alongside stdout's final EOF.
-                # Do not wait for it to finish: a misbehaving child could keep
-                # stderr open after closing stdout, and this error path must
-                # still return promptly.
-                if self._stderr_task is not None and not self._stderr_task.done():
-                    await asyncio.sleep(0)
-                try:
-                    returncode = await self.proc.wait()
-                except Exception:
-                    returncode = self.proc.returncode
-                return _SpawnOutcome(
-                    error=(
-                        "claude process ended before a result "
-                        f"(exit {returncode}): {self._stderr_summary()}"
-                    )
+    async def _handle_stdout_eof(self) -> None:
+        if self.intentional_stop:
+            self._resolve_turn(
+                _SpawnOutcome(error="Claude turn was stopped", interrupted=True)
+            )
+            return
+        # Give the always-running stderr task one event-loop turn to consume
+        # bytes that arrived alongside stdout's final EOF.  Do not wait for it
+        # to finish: a misbehaving child could keep stderr open after closing
+        # stdout, and this error path must still resolve the turn promptly.
+        if self._stderr_task is not None and not self._stderr_task.done():
+            await asyncio.sleep(0)
+        try:
+            returncode = (
+                await asyncio.wait_for(self.proc.wait(), timeout=self._EOF_REAP_TIMEOUT)
+                if self.proc is not None else None
+            )
+        except Exception:
+            # Includes the timeout: report whatever returncode we have and let
+            # the turn fail now rather than holding it open on a stuck child.
+            returncode = self.proc.returncode if self.proc is not None else None
+        self._resolve_turn(
+            _SpawnOutcome(
+                error=(
+                    "claude process ended before a result "
+                    f"(exit {returncode}): {self._stderr_summary()}"
                 )
-            try:
-                event = json.loads(line.decode("utf-8", errors="replace"))
-            except Exception as exc:
-                logger.warning("claude_bridge: ignoring unparseable stream-json line: %s", exc)
-                continue
-            if not isinstance(event, dict):
-                logger.warning("claude_bridge: ignoring non-object stream-json event")
-                continue
-            if event.get("type") == "result":
-                self._completed_result_count += 1
-                return _SpawnOutcome(parsed=event)
+            )
+        )
+
+    def _consume_line(self, line: bytes) -> None:
+        try:
+            event = json.loads(line.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            logger.warning("claude_bridge: ignoring unparseable stream-json line: %s", exc)
+            return
+        if not isinstance(event, dict):
+            logger.warning("claude_bridge: ignoring non-object stream-json event")
+            return
+        if event.get("type") != "result":
+            return
+        self._completed_result_count += 1
+        if self._is_unsolicited(event):
+            self._emit_unsolicited(event)
+            return
+        if not self._resolve_turn(_SpawnOutcome(parsed=event)):
+            # Nobody is waiting, so this cannot be an answer we owe anyone.
+            # Dropping it here is what keeps a single mis-attribution from
+            # shifting every later reply by one.
+            logger.warning(
+                "claude_bridge: discarding a result that arrived with no turn "
+                "waiting for it (session=%s)", event.get("session_id"),
+            )
+
+    @classmethod
+    def _is_unsolicited(cls, event: Dict[str, Any]) -> bool:
+        """True when the CLI ran this turn on its own, not from our stdin."""
+        origin = event.get("origin")
+        if not origin:
+            return False
+        kind = origin.get("kind") if isinstance(origin, dict) else origin
+        return str(kind) not in cls._SELF_ORIGIN_KINDS
+
+    def _emit_unsolicited(self, event: Dict[str, Any]) -> None:
+        if self._on_unsolicited_result is None:
+            return
+        try:
+            self._on_unsolicited_result(event)
+        except Exception:
+            logger.exception("claude_bridge: unsolicited-result handler failed")
+
+    def _resolve_turn(self, outcome: _SpawnOutcome) -> bool:
+        waiter = self._turn_waiter
+        if waiter is None or waiter.done():
+            return False
+        self._turn_waiter = None
+        waiter.set_result(outcome)
+        return True
 
     async def terminate(self) -> None:
-        """Kill the subprocess and cancel its stderr drainer, idempotently."""
+        """Kill the subprocess and cancel its stream drainers, idempotently."""
         proc = self.proc
         if proc is not None and proc.returncode is None:
             try:
@@ -366,21 +476,38 @@ class _ClaudeProcess:
             except Exception:
                 logger.debug("claude_bridge: failed to reap claude process", exc_info=True)
 
-        task = self._stderr_task
-        if task is not None and task is not asyncio.current_task() and not task.done():
+        for task in (self._stderr_task, self._stdout_task):
+            if task is None or task is asyncio.current_task() or task.done():
+                continue
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
             except Exception:
-                logger.debug("claude_bridge: stderr task cleanup failed", exc_info=True)
+                logger.debug("claude_bridge: stream task cleanup failed", exc_info=True)
+
+        # The drainer that would have reported EOF is gone, so a turn still
+        # waiting here would otherwise hang until its own timeout.
+        self._resolve_turn(
+            _SpawnOutcome(
+                error=(
+                    "Claude turn was stopped" if self.intentional_stop
+                    else "claude process was terminated before a result"
+                ),
+                interrupted=self.intentional_stop,
+            )
+        )
 
 
 class ClaudeBridge:
     """Owns persistent Claude processes, session continuity, and halt state."""
 
-    def __init__(self, config: ClaudeBridgeConfig):
+    def __init__(
+        self,
+        config: ClaudeBridgeConfig,
+        notifier: Optional[Callable[[str, str], Awaitable[None]]] = None,
+    ):
         self.config = config
         self._sessions = _SessionMap(sessions_file())
         self._key_locks: Dict[str, asyncio.Lock] = {}
@@ -390,6 +517,8 @@ class ClaudeBridge:
         self._turns_in_progress: set[str] = set()
         self._stop_requested_keys: set[str] = set()
         self._idle_reaper_task: Optional[asyncio.Task] = None
+        self._notifier = notifier
+        self._notice_tasks: set[asyncio.Task] = set()
         self._closed = False
         # Surface a misconfiguration at startup rather than staying silent
         # until the first inbound message hits the same check in
@@ -404,6 +533,57 @@ class ClaudeBridge:
     @property
     def enabled(self) -> bool:
         return bool(self.config.enabled)
+
+    def set_notifier(
+        self, notifier: Optional[Callable[[str, str], Awaitable[None]]]
+    ) -> None:
+        """Bind the sink for turns the CLI ran without a prompt from us.
+
+        Kept platform-agnostic like ``OutboxWatcher``'s poster: the caller
+        supplies ``(channel_key, text) -> awaitable``.  Without one, a
+        background task's completion report is logged and dropped rather than
+        surfacing in the chat that started it.
+        """
+        self._notifier = notifier
+
+    def _handle_unsolicited_result(self, key: str, event: Dict[str, Any]) -> None:
+        """Route a self-started turn's result away from the message stream."""
+        session_id = event.get("session_id")
+        if session_id:
+            self._sessions.set(key, str(session_id))
+        origin = event.get("origin")
+        logger.info(
+            "claude_bridge: unsolicited turn for key=%s origin=%s is_error=%s",
+            key, origin, event.get("is_error"),
+        )
+        text = event.get("result")
+        if event.get("is_error") or not isinstance(text, str) or not text.strip():
+            return
+        notifier = self._notifier
+        if notifier is None:
+            logger.info(
+                "claude_bridge: no notifier bound — dropping unsolicited text for %s", key
+            )
+            return
+        task = asyncio.create_task(self._deliver_notice(notifier, key, text))
+        # Held so the loop cannot garbage-collect an in-flight delivery.
+        self._notice_tasks.add(task)
+        task.add_done_callback(self._notice_tasks.discard)
+
+    async def _deliver_notice(
+        self,
+        notifier: Callable[[str, str], Awaitable[None]],
+        key: str,
+        text: str,
+    ) -> None:
+        try:
+            await notifier(key, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "claude_bridge: failed to deliver unsolicited result for %s", key
+            )
 
     async def _lock_for(self, key: str) -> asyncio.Lock:
         async with self._key_locks_guard:
@@ -494,6 +674,9 @@ class ClaudeBridge:
             working_dir=self.config.working_dir,
             resume_session_id=resume_session_id,
             extra_args=self.config.extra_args,
+            on_unsolicited_result=(
+                lambda event, key=key: self._handle_unsolicited_result(key, event)
+            ),
         )
         spawn_error = await proc.start()
         if spawn_error is not None:
@@ -542,6 +725,12 @@ class ClaudeBridge:
                 await task
             except asyncio.CancelledError:
                 pass
+        notices = list(self._notice_tasks)
+        self._notice_tasks.clear()
+        for notice in notices:
+            notice.cancel()
+        if notices:
+            await asyncio.gather(*notices, return_exceptions=True)
         await self._discard_all_processes(intentional_stop=True)
 
     async def handle_message(self, event: MessageEvent) -> Optional[str]:

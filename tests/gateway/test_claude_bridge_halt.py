@@ -45,9 +45,19 @@ def _successful_process():
     proc.stdin = MagicMock()
     proc.stdin.drain = AsyncMock()
     proc.stdout = MagicMock()
-    proc.stdout.readline = AsyncMock(return_value=(json.dumps({
+    # One result line, then silence.  The bridge drains stdout for the whole
+    # life of the process, so a mock that repeats its result forever would
+    # model a CLI that does not exist.
+    pending = [(json.dumps({
         "type": "result", "result": "ok", "session_id": "s1", "is_error": False,
-    }) + "\n").encode())
+    }) + "\n").encode()]
+
+    async def _readline():
+        if pending:
+            return pending.pop(0)
+        await asyncio.Event().wait()
+
+    proc.stdout.readline = _readline
     proc.stderr = MagicMock()
     proc.stderr.read = AsyncMock(return_value=b"")
     proc.wait = AsyncMock(return_value=0)

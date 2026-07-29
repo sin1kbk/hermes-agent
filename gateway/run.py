@@ -1754,7 +1754,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from gateway.claude_bridge import ClaudeBridge, OutboxWatcher
+from gateway.claude_bridge import ClaudeBridge, OutboxWatcher, parse_channel_key
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
@@ -7418,6 +7418,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # reconnect watcher and the multiplex connect path (F1) so a bridge
         # enabled before Discord's first successful connect still gets one.
         self._start_claude_bridge_outbox_watcher()
+        self._bind_claude_bridge_notifier()
 
         logger.info("Press Ctrl+C to stop")
         
@@ -7967,6 +7968,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # chance to start if it hasn't yet (F1). Idempotent.
                         try:
                             self._start_claude_bridge_outbox_watcher(adapter)
+                            self._bind_claude_bridge_notifier(adapter)
                         except Exception:
                             logger.debug(
                                 "claude_bridge outbox watcher start after %s reconnect failed",
@@ -8660,6 +8662,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # chance to start from here too (F1). Idempotent.
                     try:
                         self._start_claude_bridge_outbox_watcher(adapter)
+                        self._bind_claude_bridge_notifier(adapter)
                     except Exception:
                         logger.debug(
                             "claude_bridge outbox watcher start after profile "
@@ -8913,6 +8916,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self.claude_bridge.enabled:
             return self._claude_bridge_handler
         return self._handle_message
+
+    def _bind_claude_bridge_notifier(self, adapter: Optional[Any] = None) -> None:
+        """Give the bridge somewhere to post turns Claude ran unprompted.
+
+        A finished background task makes the CLI run a turn nobody sent a
+        message for, so its report has nothing to be the reply to. Called
+        from the same connect paths as ``_start_claude_bridge_outbox_watcher``
+        and re-binds freely: the adapter object changes across reconnects.
+        """
+        if not self.claude_bridge.enabled:
+            return
+        if adapter is None:
+            adapter = self.adapters.get(Platform.DISCORD)
+        send = getattr(adapter, "send", None)
+        if send is None:
+            return
+        adapter_platform = getattr(adapter, "platform", None)
+        platform_value = getattr(adapter_platform, "value", None)
+
+        async def _post_unsolicited(key: str, text: str) -> None:
+            platform, chat_id, thread_id = parse_channel_key(key)
+            if chat_id is None or (platform_value and platform != platform_value):
+                logger.warning(
+                    "claude_bridge: no route for unsolicited result on key %r", key,
+                )
+                return
+            metadata = {"thread_id": thread_id} if thread_id else None
+            await send(chat_id, text, metadata=metadata)
+
+        self.claude_bridge.set_notifier(_post_unsolicited)
 
     def _start_claude_bridge_outbox_watcher(self, adapter: Optional[Any] = None) -> None:
         """Start the Claude bridge escalation-outbox watcher, once.
