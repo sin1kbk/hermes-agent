@@ -289,12 +289,21 @@ class _ClaudeProcess:
             # other spawn sites' circular-import avoidance.
             from tools.environments.local import hermes_subprocess_env
 
+            # hermes_subprocess_env's dynamic matcher keys on KEY/SECRET/TOKEN
+            # name fragments, so PASSWORD-class secrets (e.g. the dashboard's
+            # basic-auth password) sail through it — measured on a live spawn.
+            env = {
+                k: v
+                for k, v in hermes_subprocess_env().items()
+                if "PASSWORD" not in k and "PASSPHRASE" not in k
+            }
+
             # Claude can emit a result line far larger than asyncio's default
             # 64 KiB StreamReader limit, so keep a deliberately generous cap.
             self.proc = await asyncio.create_subprocess_exec(
                 *args,
                 cwd=self._working_dir,
-                env=hermes_subprocess_env(),
+                env=env,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
