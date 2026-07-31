@@ -705,7 +705,7 @@ class ClaudeBridge:
 
         proc = _ClaudeProcess(
             claude_bin=self.config.claude_bin,
-            working_dir=self.config.working_dir,
+            working_dir=self.config.resolved_working_dir,
             resume_session_id=resume_session_id,
             # The mode is read at spawn time, not cached on the process, so a
             # respawn after /mode or an idle reap picks up the current value.

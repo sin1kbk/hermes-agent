@@ -317,6 +317,19 @@ class TestClaudeBridgeConfig:
         assert restored.enabled is False
         assert restored.decision_channels == []
 
+    def test_resolved_working_dir_expands_tilde_without_rewriting_config(self):
+        restored = ClaudeBridgeConfig.from_dict(
+            {"enabled": True, "working_dir": "~/.hermes/claude-workspace"}
+        )
+        assert restored.resolved_working_dir == os.path.expanduser(
+            "~/.hermes/claude-workspace"
+        )
+        # The tilde survives a save so a shared config.yaml stays portable.
+        assert restored.to_dict()["working_dir"] == "~/.hermes/claude-workspace"
+
+    def test_resolved_working_dir_is_none_when_unset(self):
+        assert ClaudeBridgeConfig.from_dict({}).resolved_working_dir is None
+
 
 class TestGatewayConfigRoundtrip:
     def test_full_roundtrip(self):

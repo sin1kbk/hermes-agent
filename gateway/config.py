@@ -666,6 +666,19 @@ class ClaudeBridgeConfig:
     # a buggy or compromised prompt could direct a decision post.
     decision_channels: List[str] = field(default_factory=list)
 
+    @property
+    def resolved_working_dir(self) -> Optional[str]:
+        """``working_dir`` with a leading ``~`` expanded, for use as a cwd.
+
+        ``working_dir`` itself keeps the unexpanded string so ``to_dict`` round-
+        trips it: config.yaml is shared between machines with different $HOME,
+        and writing the expanded path back on a config save would pin the
+        workspace to whichever machine saved last.
+        """
+        if not self.working_dir:
+            return None
+        return os.path.expanduser(self.working_dir)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "enabled": self.enabled,
