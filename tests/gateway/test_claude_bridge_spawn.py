@@ -513,3 +513,25 @@ async def test_error_and_empty_unsolicited_results_are_not_posted(monkeypatch, h
 
     assert notices == []
     await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_spawn_env_strips_gateway_secrets(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("ok")]])
+    spawn = AsyncMock(return_value=proc)
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "gateway-bot-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-secret")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    bridge = _bridge(hermes_home)
+
+    assert await bridge.handle_message(_event("hello")) == "ok"
+
+    env = spawn.call_args.kwargs["env"]
+    # Tier 1 (always stripped) and Tier 2 (provider credentials) both gone;
+    # inheriting a provider key would flip claude off its own stored login.
+    assert "DISCORD_BOT_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    # Sanitized, not emptied: the process still needs a normal environment.
+    assert env["PATH"] == "/usr/bin:/bin"
+    await bridge.close()

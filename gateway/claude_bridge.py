@@ -281,11 +281,20 @@ class _ClaudeProcess:
         args += self._extra_args
 
         try:
+            # The gateway's environment carries every injected secret (bot
+            # tokens, provider API keys). None of them belongs in the bridged
+            # session: its shell is driven by whoever talks to the bot, and an
+            # inherited provider key would also flip the CLI from its own
+            # stored login onto direct API billing. Lazy import mirrors the
+            # other spawn sites' circular-import avoidance.
+            from tools.environments.local import hermes_subprocess_env
+
             # Claude can emit a result line far larger than asyncio's default
             # 64 KiB StreamReader limit, so keep a deliberately generous cap.
             self.proc = await asyncio.create_subprocess_exec(
                 *args,
                 cwd=self._working_dir,
+                env=hermes_subprocess_env(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
