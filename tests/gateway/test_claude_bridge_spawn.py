@@ -523,6 +523,11 @@ async def test_spawn_env_strips_gateway_secrets(monkeypatch, hermes_home):
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "gateway-bot-secret")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-secret")
     monkeypatch.setenv("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "dashboard-pass")
+    # Personal secrets outside hermes' own strip lists (measured leaking on
+    # a shell-started gateway).
+    monkeypatch.setenv("BRAVE_API_KEY", "personal-1")
+    monkeypatch.setenv("LINEAR_API_TOKEN", "personal-2")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "personal-3")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     bridge = _bridge(hermes_home)
 
@@ -536,6 +541,9 @@ async def test_spawn_env_strips_gateway_secrets(monkeypatch, hermes_home):
     # PASSWORD-class names escape hermes_subprocess_env's KEY/SECRET/TOKEN
     # matcher, so the bridge strips them itself.
     assert "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" not in env
+    assert "BRAVE_API_KEY" not in env
+    assert "LINEAR_API_TOKEN" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
     # Sanitized, not emptied: the process still needs a normal environment.
     assert env["PATH"] == "/usr/bin:/bin"
     await bridge.close()

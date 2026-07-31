@@ -40,6 +40,21 @@ logger = logging.getLogger(__name__)
 
 DECISION_REQUIRED_KEYS = ("decision_id", "channel_id", "question", "options")
 
+# Env var name fragments that mark a value as secret-like. Broader than
+# hermes_subprocess_env's own lists on purpose: over-stripping costs the
+# bridged session nothing (its claude authenticates from its own stored
+# login, not env), while under-stripping hands secrets to a session driven
+# by whoever talks to the bot. `_KEY` also catches `_API_KEY`/`ACCESS_KEY_ID`.
+_SECRET_NAME_FRAGMENTS = (
+    "PASSWORD",
+    "PASSPHRASE",
+    "SECRET",
+    "CREDENTIAL",
+    "APIKEY",
+    "_TOKEN",
+    "_KEY",
+)
+
 
 def _bridge_home() -> Path:
     return get_hermes_home() / "claude_bridge"
@@ -289,13 +304,17 @@ class _ClaudeProcess:
             # other spawn sites' circular-import avoidance.
             from tools.environments.local import hermes_subprocess_env
 
-            # hermes_subprocess_env's dynamic matcher keys on KEY/SECRET/TOKEN
-            # name fragments, so PASSWORD-class secrets (e.g. the dashboard's
-            # basic-auth password) sail through it — measured on a live spawn.
+            # hermes_subprocess_env strips Hermes's OWN secrets (fixed lists
+            # plus narrow AUXILIARY_*/GATEWAY_RELAY_* patterns) — it knows
+            # nothing about personal secrets the gateway's environment may
+            # carry (measured on live spawns: a dashboard basic-auth PASSWORD,
+            # and BRAVE/OBSIDIAN/LINEAR/CONTEXT7 API keys inherited from a
+            # shell-started gateway). Drop anything secret-looking by name;
+            # a bridged session has no legitimate use for any of them.
             env = {
                 k: v
                 for k, v in hermes_subprocess_env().items()
-                if "PASSWORD" not in k and "PASSPHRASE" not in k
+                if not any(f in k for f in _SECRET_NAME_FRAGMENTS)
             }
 
             # Claude can emit a result line far larger than asyncio's default
