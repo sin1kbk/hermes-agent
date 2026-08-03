@@ -127,6 +127,7 @@ def build_relay_command_manifest() -> List[Dict[str, Any]]:
             "description": "Deny a pending dangerous command",
             "options": [_opt("reason", "Why (relayed to the agent)")],
         },
+        {"name": "yolo", "description": "Toggle skipping approval prompts"},
         {
             "name": "thread",
             "description": "Create a new thread and start a Hermes session in it",

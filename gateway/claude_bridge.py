@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 
 DECISION_REQUIRED_KEYS = ("decision_id", "channel_id", "question", "options")
 
+# Permission mode `/yolo` switches a channel to. The native `/yolo` bypasses
+# Hermes' own dangerous-command approval gate, which the bridged CLI never
+# passes through; the closest thing on this path is the CLI's own permission
+# mode, so the shared name means "stop asking me" on both.
+YOLO_PERMISSION_MODE = "bypassPermissions"
+
 # Env var name fragments that mark a value as secret-like. Broader than
 # hermes_subprocess_env's own lists on purpose: over-stripping costs the
 # bridged session nothing (its claude authenticates from its own stored
@@ -600,18 +606,18 @@ class ClaudeBridge:
                 "unset — every bridged message will fail until it's configured"
             )
         # halt_users is fail-open by design (an empty list lets anyone stop the
-        # bridge), but /mode reuses it to *widen* permissions.  Surface the one
-        # combination where that inversion has teeth.
+        # bridge), but /mode and /yolo reuse it to *widen* permissions.
+        # Surface the one combination where that inversion has teeth.
         if (
             config.enabled
             and not config.halt_users
             and "bypassPermissions" in self._allowed_modes()
         ):
             logger.warning(
-                "claude_bridge: /mode can raise a channel to bypassPermissions "
-                "and claude_bridge.halt_users is empty, so any paired sender "
-                "may do it — set halt_users, or drop bypassPermissions from "
-                "allowed_permission_modes"
+                "claude_bridge: /mode and /yolo can raise a channel to "
+                "bypassPermissions and claude_bridge.halt_users is empty, so "
+                "any paired sender may do it — set halt_users, or drop "
+                "bypassPermissions from allowed_permission_modes"
             )
 
     @property
@@ -909,6 +915,8 @@ class ClaudeBridge:
             )
         if command == "mode":
             return await self._handle_mode_command(event, key)
+        if command == "yolo":
+            return await self._handle_yolo_command(event, key)
         if command == "stop":
             if key in self._turns_in_progress:
                 self._stop_requested_keys.add(key)
@@ -970,6 +978,73 @@ class ClaudeBridge:
                 f"Allowed: {' | '.join(allowed)}, or default."
             )
 
+        effective = await self._apply_mode(key, target, user_id)
+        return (
+            f"Permission mode for this channel is now {effective}, starting with "
+            f"the next message. A gateway restart returns it to "
+            f"{self.config.default_permission_mode}."
+        )
+
+    async def _handle_yolo_command(self, event: MessageEvent, key: str) -> str:
+        """``/yolo`` — toggle this channel between its default mode and bypass.
+
+        Mirrors the native gateway command of the same name: no arguments, a
+        plain toggle.  It acts on a different layer (see
+        ``YOLO_PERMISSION_MODE``), so the reply names the mode it landed on
+        rather than claiming the native command's effect.
+        """
+        # Authorization first, like /mode: the configured mode list must not be
+        # readable by a sender who is not allowed to change the mode, and every
+        # rejection has to leave its sender in the log.
+        user_id = _event_user_id(event)
+        if not self._is_halt_authorized(event):
+            logger.warning(
+                "claude_bridge: rejected unauthorized /yolo from %s in %s",
+                user_id,
+                key,
+            )
+            return "Not authorized to change the Claude permission mode."
+
+        allowed = self._allowed_modes()
+        if YOLO_PERMISSION_MODE not in allowed:
+            logger.warning(
+                "claude_bridge: rejected /yolo from %s in %s (%s not allowed)",
+                user_id,
+                key,
+                YOLO_PERMISSION_MODE,
+            )
+            return (
+                f"/yolo needs {YOLO_PERMISSION_MODE}, which "
+                f"claude_bridge.allowed_permission_modes does not include "
+                f"({' | '.join(allowed)})."
+            )
+
+        turning_on = self._effective_mode(key) != YOLO_PERMISSION_MODE
+        effective = await self._apply_mode(
+            key, YOLO_PERMISSION_MODE if turning_on else None, user_id
+        )
+        if turning_on:
+            return (
+                f"YOLO on: permission mode {effective} for this channel, "
+                "starting with the next message. Send /yolo again to turn it "
+                "off; a gateway restart also does."
+            )
+        if effective == YOLO_PERMISSION_MODE:
+            # Clearing the override cannot go below the configured default.
+            return (
+                f"YOLO override cleared, but claude_bridge."
+                f"default_permission_mode is {effective}, so this channel "
+                "still bypasses permission checks."
+            )
+        return (
+            f"YOLO off: permission mode is back to {effective}, starting with "
+            "the next message."
+        )
+
+    async def _apply_mode(
+        self, key: str, target: Optional[str], user_id: str
+    ) -> str:
+        """Set (``target``) or clear (``None``) the override; return what took effect."""
         lock = await self._lock_for(key)
         async with lock:
             previous = self._effective_mode(key)
@@ -991,11 +1066,7 @@ class ClaudeBridge:
             key,
             effective,
         )
-        return (
-            f"Permission mode for this channel is now {effective}, starting with "
-            f"the next message. A gateway restart returns it to "
-            f"{self.config.default_permission_mode}."
-        )
+        return effective
 
     async def _handle_locked(self, key: str, text: str, model: str, effort: str) -> str:
         resume_id = self._sessions.get(key)
