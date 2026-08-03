@@ -248,12 +248,14 @@ class _ClaudeProcess:
         working_dir: str,
         resume_session_id: Optional[str],
         extra_args: List[str],
+        model: str = "claude-code",
         on_unsolicited_result: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self._claude_bin = claude_bin
         self._working_dir = working_dir
         self._resume_session_id = resume_session_id
         self._extra_args = list(extra_args)
+        self.model = model
         self._on_unsolicited_result = on_unsolicited_result
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
@@ -294,6 +296,8 @@ class _ClaudeProcess:
         if self._resume_session_id:
             args += ["--resume", self._resume_session_id]
         args += self._extra_args
+        if self.model != "claude-code":
+            args += ["--model", self.model]
 
         try:
             # The gateway's environment carries every injected secret (bot
@@ -732,11 +736,18 @@ class ClaudeBridge:
         )
 
     async def _get_or_spawn_process(
-        self, key: str, resume_session_id: Optional[str]
+        self, key: str, resume_session_id: Optional[str], model: str
     ) -> tuple[Optional[_ClaudeProcess], Optional[_SpawnOutcome]]:
         existing = self._procs.get(key)
-        if existing is not None and existing.is_alive:
+        if existing is not None and existing.is_alive and existing.model == model:
             return existing, None
+        if existing is not None and existing.is_alive:
+            logger.info(
+                "claude_bridge: model changed for %s (%s -> %s); respawning",
+                key,
+                existing.model,
+                model,
+            )
         if existing is not None:
             await self._discard_process(key, existing)
 
@@ -754,6 +765,7 @@ class ClaudeBridge:
                 "--permission-mode",
                 self._effective_mode(key),
             ],
+            model=model,
             on_unsolicited_result=(
                 lambda event, key=key: self._handle_unsolicited_result(key, event)
             ),
@@ -813,8 +825,11 @@ class ClaudeBridge:
             await asyncio.gather(*notices, return_exceptions=True)
         await self._discard_all_processes(intentional_stop=True)
 
-    async def handle_message(self, event: MessageEvent) -> Optional[str]:
+    async def handle_message(
+        self, event: MessageEvent, *, model: str = "claude-code"
+    ) -> Optional[str]:
         """Gateway ``MessageHandler`` for sessions routed to this provider."""
+        model = model.strip() if isinstance(model, str) and model.strip() else "claude-code"
         text = (event.text or "").strip()
 
         if text == "!halt":
@@ -872,7 +887,7 @@ class ClaudeBridge:
         lock = await self._lock_for(key)
         async with self._semaphore:
             async with lock:
-                return await self._handle_locked(key, text)
+                return await self._handle_locked(key, text, model)
 
     async def _handle_mode_command(self, event: MessageEvent, key: str) -> str:
         """``/mode [name|default]`` — read or switch this channel's mode.
@@ -945,11 +960,11 @@ class ClaudeBridge:
             f"{self.config.default_permission_mode}."
         )
 
-    async def _handle_locked(self, key: str, text: str) -> str:
+    async def _handle_locked(self, key: str, text: str, model: str) -> str:
         resume_id = self._sessions.get(key)
         self._turns_in_progress.add(key)
         try:
-            proc, spawn_error = await self._get_or_spawn_process(key, resume_id)
+            proc, spawn_error = await self._get_or_spawn_process(key, resume_id, model)
             attempted_resume = proc is not None and proc.is_unproven_resume
             outcome = spawn_error or await proc.send_turn(text, self.config.timeout_seconds)
             self._save_result_session(key, outcome)
@@ -981,7 +996,7 @@ class ClaudeBridge:
                 if proc is not None:
                     await self._discard_process(key, proc)
                 self._sessions.clear(key)
-                proc, spawn_error = await self._get_or_spawn_process(key, None)
+                proc, spawn_error = await self._get_or_spawn_process(key, None, model)
                 outcome = spawn_error or await proc.send_turn(text, self.config.timeout_seconds)
                 self._save_result_session(key, outcome)
                 fallback_note = "\n\n(resume failed — started a new Claude session)"

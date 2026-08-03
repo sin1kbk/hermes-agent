@@ -38,11 +38,13 @@ def _event(text: str = "hello", chat_id: str = "c1") -> MessageEvent:
     )
 
 
-def _write_config(tmp_path, monkeypatch, provider: str) -> None:
+def _write_config(
+    tmp_path, monkeypatch, provider: str, *, default_model: str = "configured-model"
+) -> None:
     (tmp_path / "config.yaml").write_text(
         yaml.safe_dump(
             {
-                "model": {"default": "configured-model", "provider": provider},
+                "model": {"default": default_model, "provider": provider},
                 "claude_bridge": {"enabled": True, "working_dir": str(tmp_path)},
             }
         ),
@@ -51,11 +53,13 @@ def _write_config(tmp_path, monkeypatch, provider: str) -> None:
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
 
-def _runner(*, enabled: bool = True, channel_provider: str = "") -> GatewayRunner:
+def _runner(
+    *, enabled: bool = True, channel_provider: str = "", channel_model: str = ""
+) -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
     channel_overrides = (
-        {"c1": ChannelOverride(provider=channel_provider)}
-        if channel_provider
+        {"c1": ChannelOverride(provider=channel_provider, model=channel_model or None)}
+        if channel_provider or channel_model
         else {}
     )
     runner.config = GatewayConfig(
@@ -74,6 +78,38 @@ def _runner(*, enabled: bool = True, channel_provider: str = "") -> GatewayRunne
     runner._handle_message = AsyncMock(return_value="native")
     runner._claude_bridge_handler = AsyncMock(return_value="bridge")
     return runner
+
+
+@pytest.mark.asyncio
+async def test_bridge_session_model_override_is_forwarded_to_the_handler(
+    tmp_path, monkeypatch
+):
+    _write_config(tmp_path, monkeypatch, CLAUDE_BRIDGE_PROVIDER_ID)
+    runner = _runner()
+    session_key = runner._session_key_for_source(_event().source)
+    runner._session_model_overrides[session_key] = {
+        "model": "claude-opus-5",
+        "provider": CLAUDE_BRIDGE_PROVIDER_ID,
+    }
+
+    event = _event()
+    assert await runner._select_message_handler()(event) == "bridge"
+    runner._claude_bridge_handler.assert_awaited_once_with(event, model="claude-opus-5")
+
+
+@pytest.mark.asyncio
+async def test_bridge_channel_model_override_is_forwarded_to_the_handler(
+    tmp_path, monkeypatch
+):
+    _write_config(tmp_path, monkeypatch, "ollama-launch")
+    runner = _runner(
+        channel_provider=CLAUDE_BRIDGE_PROVIDER_ID,
+        channel_model="claude-opus-5",
+    )
+
+    event = _event()
+    assert await runner._select_message_handler()(event) == "bridge"
+    runner._claude_bridge_handler.assert_awaited_once_with(event, model="claude-opus-5")
 
 
 @pytest.mark.asyncio
@@ -99,6 +135,23 @@ async def test_enabled_bridge_routes_each_message_by_global_provider(
     else:
         runner._handle_message.assert_awaited_once()
         runner._claude_bridge_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bridge_global_default_model_is_forwarded_to_the_handler(
+    tmp_path, monkeypatch
+):
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        CLAUDE_BRIDGE_PROVIDER_ID,
+        default_model="claude-opus-5",
+    )
+    runner = _runner()
+    event = _event()
+
+    assert await runner._select_message_handler()(event) == "bridge"
+    runner._claude_bridge_handler.assert_awaited_once_with(event, model="claude-opus-5")
 
 
 @pytest.mark.asyncio
@@ -331,6 +384,26 @@ def test_bridge_provider_listing_is_gated_by_enabled_flag(monkeypatch):
     )
 
 
+def test_bridge_provider_listing_uses_configured_models(monkeypatch):
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    rows = list_authenticated_providers(
+        current_provider=CLAUDE_BRIDGE_PROVIDER_ID,
+        current_model="claude-opus-5",
+        user_providers={},
+        custom_providers=[],
+        max_models=0,
+        include_claude_bridge=True,
+        claude_bridge_models=["claude-opus-5"],
+    )
+
+    bridge_row = next(row for row in rows if row["slug"] == CLAUDE_BRIDGE_PROVIDER_ID)
+    assert bridge_row["is_current"] is True
+    assert bridge_row["models"] == [CLAUDE_BRIDGE_MODEL_ID, "claude-opus-5"]
+    assert bridge_row["total_models"] == 2
+
+
 def test_bridge_provider_switch_requires_enabled_flag(monkeypatch):
     from hermes_cli.model_switch import switch_model
 
@@ -358,6 +431,32 @@ def test_bridge_provider_switch_requires_enabled_flag(monkeypatch):
     assert allowed.new_model == CLAUDE_BRIDGE_MODEL_ID
     assert allowed.base_url == ""
     assert allowed.api_key == ""
+
+
+def test_bridge_provider_switch_rejects_models_not_in_config(monkeypatch):
+    from hermes_cli.model_switch import switch_model
+
+    monkeypatch.setattr("agent.models_dev.get_provider_info", lambda _provider: None)
+    allowed = switch_model(
+        raw_input="claude-bridge/claude-opus-5",
+        current_provider="ollama-launch",
+        current_model="qwen",
+        allow_claude_bridge=True,
+        claude_bridge_models=["claude-opus-5"],
+    )
+    denied = switch_model(
+        raw_input="gpt-5",
+        current_provider="ollama-launch",
+        current_model="qwen",
+        explicit_provider=CLAUDE_BRIDGE_PROVIDER_ID,
+        allow_claude_bridge=True,
+        claude_bridge_models=["claude-opus-5"],
+    )
+
+    assert allowed.success is True
+    assert allowed.new_model == "claude-opus-5"
+    assert denied.success is False
+    assert "not configured" in denied.error_message
 
 
 def test_bridge_endpoint_resolution_fails_closed(tmp_path, monkeypatch):

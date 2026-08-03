@@ -7,6 +7,7 @@ binary or network service.
 
 import asyncio
 import json
+import logging
 import time
 from collections import deque
 from unittest.mock import AsyncMock
@@ -134,6 +135,67 @@ async def test_two_turns_reuse_one_process_and_write_stream_json_to_stdin(monkey
     )
     assert "--verbose" in args
     assert spawn.call_args.kwargs["limit"] == 10 * 1024 * 1024
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_configured_model_is_appended_after_extra_args(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("ok")]])
+    spawn = AsyncMock(return_value=proc)
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home, extra_args=["--model", "claude-haiku-4"])
+
+    assert await bridge.handle_message(_event("hello"), model="claude-opus-5") == "ok"
+
+    args = spawn.call_args.args
+    last_model = len(args) - 1 - args[::-1].index("--model")
+    assert args[last_model + 1] == "claude-opus-5"
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_reserved_model_omits_model_argument(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("ok")]])
+    spawn = AsyncMock(return_value=proc)
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home)
+
+    assert await bridge.handle_message(_event("hello"), model="claude-code") == "ok"
+
+    assert "--model" not in spawn.call_args.args
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_model_change_replaces_resident_process_and_resumes_session(
+    monkeypatch, hermes_home, caplog
+):
+    first = _FakeProc(responses=[[_result("first", "session-1")]])
+    second = _FakeProc(responses=[[_result("second", "session-1")]])
+    respawned_dead_process = _FakeProc(responses=[[_result("third", "session-1")]])
+    spawn = AsyncMock(side_effect=[first, second, respawned_dead_process])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home)
+
+    with caplog.at_level(logging.INFO, logger="gateway.claude_bridge"):
+        assert await bridge.handle_message(_event("one"), model="claude-sonnet-4") == "first"
+        assert await bridge.handle_message(_event("two"), model="claude-opus-5") == "second"
+
+    assert first.killed is True
+    assert "--resume" in spawn.call_args_list[1].args
+    assert "session-1" in spawn.call_args_list[1].args
+    assert spawn.call_args_list[1].args[-2:] == ("--model", "claude-opus-5")
+    assert any(
+        record.message
+        == "claude_bridge: model changed for discord:c1 "
+        "(claude-sonnet-4 -> claude-opus-5); respawning"
+        for record in caplog.records
+    )
+    second.returncode = 1
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="gateway.claude_bridge"):
+        assert await bridge.handle_message(_event("three"), model="claude-haiku-4") == "third"
+    assert not any("model changed" in record.message for record in caplog.records)
     await bridge.close()
 
 

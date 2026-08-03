@@ -1745,6 +1745,8 @@ class GatewaySlashCommandsMixin:
         claude_bridge_enabled = bool(
             getattr(getattr(self, "claude_bridge", None), "enabled", False)
         )
+        bridge_config = getattr(getattr(self, "claude_bridge", None), "config", None)
+        claude_bridge_models = list(getattr(bridge_config, "models", []) or [])
         config_path = (_command_profile_home or _hermes_home) / "config.yaml"
         try:
             cfg = _load_gateway_config()
@@ -1773,13 +1775,22 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+        try:
+            effective_route = await asyncio.to_thread(
+                self._resolve_effective_message_provider, source
+            )
+            effective_provider, effective_model = effective_route
+            if effective_provider:
+                current_provider = effective_provider
+            if effective_model:
+                current_model = effective_model
+        except Exception:
+            logger.debug("Failed to resolve effective model for /model", exc_info=True)
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None
         )
         if override:
-            current_model = override.get("model", current_model)
-            current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
 
@@ -1807,6 +1818,7 @@ class GatewaySlashCommandsMixin:
                         max_models=50,
                         include_moa=True,
                         include_claude_bridge=claude_bridge_enabled,
+                        claude_bridge_models=claude_bridge_models,
                         excluded_providers=excluded_provs,
                     )
                 except Exception:
@@ -1846,6 +1858,7 @@ class GatewaySlashCommandsMixin:
                             user_providers=user_provs,
                             custom_providers=custom_provs,
                             allow_claude_bridge=claude_bridge_enabled,
+                            claude_bridge_models=claude_bridge_models,
                         )
                         if not result.success:
                             return t("gateway.model.error_prefix", error=result.error_message)
@@ -2141,6 +2154,7 @@ class GatewaySlashCommandsMixin:
                     custom_providers=custom_provs,
                     max_models=5,
                     include_claude_bridge=claude_bridge_enabled,
+                    claude_bridge_models=claude_bridge_models,
                     excluded_providers=excluded_provs,
                 )
                 for p in providers:
@@ -2181,6 +2195,7 @@ class GatewaySlashCommandsMixin:
             user_providers=user_provs,
             custom_providers=custom_provs,
             allow_claude_bridge=claude_bridge_enabled,
+            claude_bridge_models=claude_bridge_models,
         )
 
         if not result.success:

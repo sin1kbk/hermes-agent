@@ -1217,6 +1217,7 @@ def switch_model(
     user_providers: dict = None,
     custom_providers: list | None = None,
     allow_claude_bridge: bool = False,
+    claude_bridge_models: list[str] | None = None,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1252,6 +1253,7 @@ def switch_model(
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.
         allow_claude_bridge: Whether the gateway-only virtual provider is available.
+        claude_bridge_models: Models configured for the gateway-only provider.
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -1268,6 +1270,11 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
+
+    bridge_prefix = f"{CLAUDE_BRIDGE_PROVIDER_ID}/"
+    if not explicit_provider and new_model.lower().startswith(bridge_prefix):
+        explicit_provider = CLAUDE_BRIDGE_PROVIDER_ID
+        new_model = new_model[len(bridge_prefix):].strip()
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -1305,7 +1312,7 @@ def switch_model(
 
         target_provider = pdef.id
         if target_provider == CLAUDE_BRIDGE_PROVIDER_ID:
-            new_model = CLAUDE_BRIDGE_MODEL_ID
+            new_model = new_model or CLAUDE_BRIDGE_MODEL_ID
         elif target_provider == "moa" and not new_model:
             try:
                 from hermes_cli.config import load_config
@@ -1592,9 +1599,25 @@ def switch_model(
                     "claude_bridge.enabled is false."
                 ),
             )
+        allowed_models = [CLAUDE_BRIDGE_MODEL_ID]
+        for configured_model in claude_bridge_models or []:
+            candidate = str(configured_model or "").strip()
+            if candidate and candidate not in allowed_models:
+                allowed_models.append(candidate)
+        if new_model not in allowed_models:
+            return ModelSwitchResult(
+                success=False,
+                target_provider=target_provider,
+                provider_label=provider_label,
+                is_global=is_global,
+                error_message=(
+                    f"Model '{new_model}' is not configured for provider "
+                    f"'claude-bridge'. Available models: {', '.join(allowed_models)}."
+                ),
+            )
         return ModelSwitchResult(
             success=True,
-            new_model=CLAUDE_BRIDGE_MODEL_ID,
+            new_model=new_model,
             target_provider=target_provider,
             provider_changed=provider_changed,
             provider_label=provider_label,
@@ -1958,6 +1981,7 @@ def list_authenticated_providers(
     for_picker: bool = False,
     excluded_providers: list | None = None,
     include_claude_bridge: bool = False,
+    claude_bridge_models: list[str] | None = None,
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
 
@@ -3104,14 +3128,19 @@ def list_authenticated_providers(
             for row in results
         )
     ):
+        bridge_models = [CLAUDE_BRIDGE_MODEL_ID]
+        for configured_model in claude_bridge_models or []:
+            candidate = str(configured_model or "").strip()
+            if candidate and candidate not in bridge_models:
+                bridge_models.append(candidate)
         results.append(
             {
                 "slug": CLAUDE_BRIDGE_PROVIDER_ID,
                 "name": get_label(CLAUDE_BRIDGE_PROVIDER_ID),
                 "is_current": _current_provider_norm == CLAUDE_BRIDGE_PROVIDER_ID,
                 "is_user_defined": False,
-                "models": [CLAUDE_BRIDGE_MODEL_ID],
-                "total_models": 1,
+                "models": bridge_models,
+                "total_models": len(bridge_models),
                 "source": "virtual",
             }
         )
@@ -3172,6 +3201,7 @@ def list_picker_providers(
     include_moa: bool = False,
     excluded_providers: list | None = None,
     include_claude_bridge: bool = False,
+    claude_bridge_models: list[str] | None = None,
 ) -> List[dict]:
     """Interactive-picker variant of :func:`list_authenticated_providers`.
 
@@ -3203,6 +3233,7 @@ def list_picker_providers(
         current_model=current_model,
         for_picker=True,
         include_claude_bridge=include_claude_bridge,
+        claude_bridge_models=claude_bridge_models,
         excluded_providers=excluded_providers,
     )
     if include_moa:

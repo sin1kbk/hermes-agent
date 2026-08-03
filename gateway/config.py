@@ -848,6 +848,9 @@ class ClaudeBridgeConfig:
     halt_users: List[str] = field(default_factory=list)
     # Extra argv appended to the `claude -p ...` invocation.
     extra_args: List[str] = field(default_factory=list)
+    # Models selectable for the bridge. ``claude-code`` leaves model selection
+    # to the Claude CLI and remains available even when omitted here.
+    models: List[str] = field(default_factory=lambda: ["claude-code"])
     # Permission mode a channel runs under until `/mode` overrides it.  Passed
     # explicitly on every spawn rather than inherited from the user's
     # ~/.claude/settings.json, so a gateway restart always lands on a known
@@ -888,6 +891,7 @@ class ClaudeBridgeConfig:
             "idle_timeout_seconds": self.idle_timeout_seconds,
             "halt_users": list(self.halt_users),
             "extra_args": list(self.extra_args),
+            "models": list(self.models),
             "default_permission_mode": self.default_permission_mode,
             "allowed_permission_modes": list(self.allowed_permission_modes),
             "decision_channels": list(self.decision_channels),
@@ -903,6 +907,15 @@ class ClaudeBridgeConfig:
         extra_args = data.get("extra_args") or []
         if not isinstance(extra_args, list):
             extra_args = []
+        models = data.get("models")
+        if models is None:
+            models = ["claude-code"]
+        elif not isinstance(models, list):
+            logger.warning(
+                "claude_bridge.models must be a list, got %r; using claude-code only",
+                models,
+            )
+            models = ["claude-code"]
         decision_channels = data.get("decision_channels") or []
         if not isinstance(decision_channels, list):
             decision_channels = []
@@ -954,6 +967,7 @@ class ClaudeBridgeConfig:
             idle_timeout_seconds=_coerce_int(data.get("idle_timeout_seconds"), 1800),
             halt_users=[str(u) for u in halt_users],
             extra_args=[str(a) for a in extra_args],
+            models=[str(model).strip() for model in models if str(model).strip()],
             default_permission_mode=default_mode,
             allowed_permission_modes=allowed_modes,
             decision_channels=[str(c) for c in decision_channels],
