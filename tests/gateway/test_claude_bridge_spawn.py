@@ -154,6 +154,35 @@ async def test_configured_model_is_appended_after_extra_args(monkeypatch, hermes
 
 
 @pytest.mark.asyncio
+async def test_configured_effort_is_appended_after_extra_args(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("ok")]])
+    spawn = AsyncMock(return_value=proc)
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home, extra_args=["--effort", "low"])
+
+    assert await bridge.handle_message(_event("hello"), effort="high") == "ok"
+
+    args = spawn.call_args.args
+    last_effort = len(args) - 1 - args[::-1].index("--effort")
+    assert args[last_effort + 1] == "high"
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_or_invalid_effort_omits_effort_argument(monkeypatch, hermes_home):
+    proc = _FakeProc(responses=[[_result("first")], [_result("second")]])
+    spawn = AsyncMock(return_value=proc)
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home)
+
+    assert await bridge.handle_message(_event("one"), effort="") == "first"
+    assert "--effort" not in spawn.call_args_list[0].args
+    assert await bridge.handle_message(_event("two"), effort="ultra") == "second"
+    assert spawn.await_count == 1
+    await bridge.close()
+
+
+@pytest.mark.asyncio
 async def test_empty_model_omits_model_argument(monkeypatch, hermes_home):
     proc = _FakeProc(responses=[[_result("ok")]])
     spawn = AsyncMock(return_value=proc)
@@ -223,6 +252,32 @@ async def test_model_change_replaces_resident_process_and_resumes_session(
     with caplog.at_level(logging.INFO, logger="gateway.claude_bridge"):
         assert await bridge.handle_message(_event("three"), model="claude-haiku-4") == "third"
     assert not any("model changed" in record.message for record in caplog.records)
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_effort_change_replaces_resident_process_and_resumes_session(
+    monkeypatch, hermes_home, caplog
+):
+    first = _FakeProc(responses=[[_result("first", "session-1")]])
+    second = _FakeProc(responses=[[_result("second", "session-1")]])
+    spawn = AsyncMock(side_effect=[first, second])
+    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    bridge = _bridge(hermes_home)
+
+    with caplog.at_level(logging.INFO, logger="gateway.claude_bridge"):
+        assert await bridge.handle_message(_event("one"), effort="low") == "first"
+        assert await bridge.handle_message(_event("two"), effort="high") == "second"
+
+    assert first.killed is True
+    assert "--resume" in spawn.call_args_list[1].args
+    assert "session-1" in spawn.call_args_list[1].args
+    assert spawn.call_args_list[1].args[-2:] == ("--effort", "high")
+    assert any(
+        record.message
+        == "claude_bridge: effort changed for discord:c1 (low -> high); respawning"
+        for record in caplog.records
+    )
     await bridge.close()
 
 

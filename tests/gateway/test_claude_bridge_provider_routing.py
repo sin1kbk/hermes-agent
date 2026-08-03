@@ -98,6 +98,113 @@ async def test_bridge_session_model_override_is_forwarded_to_the_handler(
 
 
 @pytest.mark.asyncio
+async def test_reasoning_command_is_handled_natively_then_forwarded_to_bridge(
+    tmp_path, monkeypatch
+):
+    """A bridge session must apply /reasoning before its next CLI turn."""
+    _write_config(tmp_path, monkeypatch, CLAUDE_BRIDGE_PROVIDER_ID)
+    runner = _runner()
+
+    async def _native_reasoning_handler(event):
+        return await runner._handle_reasoning_command(event)
+
+    runner._handle_message = _native_reasoning_handler
+    router = runner._select_message_handler()
+    reasoning_event = _event("/reasoning high --session")
+
+    assert "set to `high`" in await router(reasoning_event)
+    next_event = _event("next turn")
+    assert await router(next_event) == "bridge"
+
+    runner._claude_bridge_handler.assert_awaited_once_with(
+        next_event, model="configured-model", effort="high"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bridge_resolves_global_and_per_model_reasoning_effort(
+    tmp_path, monkeypatch
+):
+    _write_config(
+        tmp_path, monkeypatch, CLAUDE_BRIDGE_PROVIDER_ID, default_model="claude-opus-5"
+    )
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "default": "claude-opus-5",
+                    "provider": CLAUDE_BRIDGE_PROVIDER_ID,
+                },
+                "agent": {
+                    "reasoning_effort": "xhigh",
+                },
+                "claude_bridge": {"enabled": True, "working_dir": str(tmp_path)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = _runner()
+    event = _event()
+
+    assert await runner._select_message_handler()(event) == "bridge"
+    runner._claude_bridge_handler.assert_awaited_once_with(
+        event, model="claude-opus-5", effort="xhigh"
+    )
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "default": "claude-opus-5",
+                    "provider": CLAUDE_BRIDGE_PROVIDER_ID,
+                },
+                "agent": {
+                    "reasoning_effort": "xhigh",
+                    "reasoning_overrides": {"claude-opus-5": "high"},
+                },
+                "claude_bridge": {"enabled": True, "working_dir": str(tmp_path)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner._claude_bridge_handler.reset_mock()
+
+    assert await runner._select_message_handler()(event) == "bridge"
+    runner._claude_bridge_handler.assert_awaited_once_with(
+        event, model="claude-opus-5", effort="high"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bridge_omits_unset_or_unsupported_reasoning_effort(
+    tmp_path, monkeypatch, caplog
+):
+    _write_config(tmp_path, monkeypatch, CLAUDE_BRIDGE_PROVIDER_ID)
+    runner = _runner()
+    event = _event()
+
+    assert await runner._select_message_handler()(event) == "bridge"
+    runner._claude_bridge_handler.assert_awaited_once_with(event, model="configured-model")
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {"default": "configured-model", "provider": CLAUDE_BRIDGE_PROVIDER_ID},
+                "agent": {"reasoning_effort": "ultra"},
+                "claude_bridge": {"enabled": True, "working_dir": str(tmp_path)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner._claude_bridge_handler.reset_mock()
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        assert await runner._select_message_handler()(event) == "bridge"
+
+    runner._claude_bridge_handler.assert_awaited_once_with(event, model="configured-model")
+    assert any("unsupported reasoning effort" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_bridge_channel_model_override_is_forwarded_to_the_handler(
     tmp_path, monkeypatch
 ):

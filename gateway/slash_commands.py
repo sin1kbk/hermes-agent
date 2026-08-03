@@ -41,7 +41,10 @@ from gateway.session import (
     is_shared_multi_user_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
-from hermes_cli.providers import CLAUDE_BRIDGE_PROVIDER_ID
+from hermes_cli.providers import (
+    CLAUDE_BRIDGE_PROVIDER_ID,
+    CLAUDE_BRIDGE_REASONING_EFFORTS,
+)
 from utils import (
     atomic_json_write,
     base_url_host_matches,
@@ -3304,6 +3307,7 @@ class GatewaySlashCommandsMixin:
         platform_key: str,
         value: str,
         persist_global: bool = False,
+        effective_provider: str = "",
     ) -> str:
         """Apply a /reasoning argument (typed or picked) and return the reply.
 
@@ -3340,6 +3344,14 @@ class GatewaySlashCommandsMixin:
         parsed = parse_reasoning_effort(value)
         if parsed is None:
             return t("gateway.reasoning.unknown_arg", arg=value)
+        if (
+            effective_provider == CLAUDE_BRIDGE_PROVIDER_ID
+            and (
+                parsed.get("enabled") is not True
+                or parsed.get("effort") not in CLAUDE_BRIDGE_REASONING_EFFORTS
+            )
+        ):
+            return t("gateway.reasoning.claude_bridge_unsupported_effort", effort=value)
 
         self._reasoning_config = parsed
         if persist_global:
@@ -3355,18 +3367,27 @@ class GatewaySlashCommandsMixin:
         self._evict_cached_agent(session_key)
         return t("gateway.reasoning.set_session", effort=value)
 
-    def _reasoning_picker_choices(self, current_effort: str) -> list:
+    def _reasoning_picker_choices(
+        self, current_effort: str, *, is_claude_bridge: bool = False
+    ) -> list:
         """Build the choice list for the interactive /reasoning picker."""
         from hermes_constants import VALID_REASONING_EFFORTS
 
-        choices = [
-            {
-                "value": "none",
-                "label": t("gateway.reasoning.choice_none"),
-                "is_current": current_effort == "none",
-            }
-        ]
-        for level in VALID_REASONING_EFFORTS:
+        levels = (
+            CLAUDE_BRIDGE_REASONING_EFFORTS
+            if is_claude_bridge
+            else VALID_REASONING_EFFORTS
+        )
+        choices = []
+        if not is_claude_bridge:
+            choices.append(
+                {
+                    "value": "none",
+                    "label": t("gateway.reasoning.choice_none"),
+                    "is_current": current_effort == "none",
+                }
+            )
+        for level in levels:
             choices.append(
                 {
                     "value": level,
@@ -3452,6 +3473,13 @@ class GatewaySlashCommandsMixin:
             session_key=session_key,
             model=_session_model,
         )
+        resolved_route = await asyncio.to_thread(
+            self._resolve_effective_message_provider, _reasoning_source
+        )
+        effective_provider = (
+            resolved_route[0] if isinstance(resolved_route, tuple) else resolved_route
+        )
+        is_claude_bridge = effective_provider == CLAUDE_BRIDGE_PROVIDER_ID
 
         if not raw_args:
             # Show current state
@@ -3483,7 +3511,10 @@ class GatewaySlashCommandsMixin:
 
             async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
                 return self._apply_reasoning_selection(
-                    session_key, _picker_platform_key, value
+                    session_key,
+                    _picker_platform_key,
+                    value,
+                    effective_provider=effective_provider,
                 )
 
             picker_sent = await self._try_send_choice_picker(
@@ -3495,7 +3526,9 @@ class GatewaySlashCommandsMixin:
                     scope=scope,
                     display=display_state,
                 ),
-                choices=self._reasoning_picker_choices(current_effort),
+                choices=self._reasoning_picker_choices(
+                    current_effort, is_claude_bridge=is_claude_bridge
+                ),
                 on_choice_selected=_on_reasoning_choice,
             )
             if picker_sent:
@@ -3511,7 +3544,11 @@ class GatewaySlashCommandsMixin:
         # Typed argument path — same applier the picker uses.
         platform_key = _platform_config_key(event.source.platform)
         return self._apply_reasoning_selection(
-            session_key, platform_key, args, persist_global=persist_global
+            session_key,
+            platform_key,
+            args,
+            persist_global=persist_global,
+            effective_provider=effective_provider,
         )
 
     async def _handle_memory_command(self, event: MessageEvent) -> str:
