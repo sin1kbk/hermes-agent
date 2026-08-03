@@ -42,7 +42,11 @@ from hermes_cli.config import (
     load_config,
     normalize_extra_headers,
 )
-from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
+from hermes_cli.providers import (
+    CLAUDE_BRIDGE_PROVIDER_ID,
+    custom_provider_aliases,
+    custom_provider_slug,
+)
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.providers import is_official_openai_host
 from utils import base_url_host_matches, base_url_hostname, env_int
@@ -1665,6 +1669,11 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+
+    if requested_provider == CLAUDE_BRIDGE_PROVIDER_ID:
+        raise ValueError(
+            "claude-bridge is a gateway-only virtual provider and has no API endpoint"
+        )
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /

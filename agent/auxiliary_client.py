@@ -5705,6 +5705,14 @@ def resolve_provider_client(
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
 
+    from hermes_cli.providers import CLAUDE_BRIDGE_PROVIDER_ID
+
+    if provider == CLAUDE_BRIDGE_PROVIDER_ID:
+        logger.warning(
+            "Auxiliary provider claude-bridge was ignored because it has no API endpoint"
+        )
+        return None, None
+
     # MoA virtual provider chokepoint: "moa" is not a real HTTP provider —
     # its acting model is the preset's aggregator slot. The two resolver
     # layers above (_resolve_auto, _resolve_task_provider_model) already

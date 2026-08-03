@@ -41,6 +41,7 @@ from gateway.session import (
     is_shared_multi_user_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
+from hermes_cli.providers import CLAUDE_BRIDGE_PROVIDER_ID
 from utils import (
     atomic_json_write,
     base_url_host_matches,
@@ -54,6 +55,15 @@ logger = logging.getLogger("gateway.run")
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
+_CLAUDE_BRIDGE_CONTEXT_NOTICE = (
+    "Context is not carried between Claude Bridge and native Hermes sessions."
+)
+
+
+def _crosses_claude_bridge(current_provider: str, target_provider: str) -> bool:
+    current = str(current_provider or "").strip().lower()
+    target = str(target_provider or "").strip().lower()
+    return current != target and CLAUDE_BRIDGE_PROVIDER_ID in {current, target}
 
 
 def _clean_str(value: Any) -> str:
@@ -1732,6 +1742,9 @@ class GatewaySlashCommandsMixin:
         user_provs = None
         custom_provs = None
         excluded_provs = []
+        claude_bridge_enabled = bool(
+            getattr(getattr(self, "claude_bridge", None), "enabled", False)
+        )
         config_path = (_command_profile_home or _hermes_home) / "config.yaml"
         try:
             cfg = _load_gateway_config()
@@ -1793,6 +1806,7 @@ class GatewaySlashCommandsMixin:
                         custom_providers=custom_provs,
                         max_models=50,
                         include_moa=True,
+                        include_claude_bridge=claude_bridge_enabled,
                         excluded_providers=excluded_provs,
                     )
                 except Exception:
@@ -1831,27 +1845,43 @@ class GatewaySlashCommandsMixin:
                             explicit_provider=provider_slug,
                             user_providers=user_provs,
                             custom_providers=custom_provs,
+                            allow_claude_bridge=claude_bridge_enabled,
                         )
                         if not result.success:
                             return t("gateway.model.error_prefix", error=result.error_message)
+                        if one_turn and (
+                            str(_cur_provider or "").strip().lower()
+                            == CLAUDE_BRIDGE_PROVIDER_ID
+                            or result.target_provider == CLAUDE_BRIDGE_PROVIDER_ID
+                        ):
+                            # Bridge turns bypass the native finally block that
+                            # restores one-turn model overrides.
+                            return t(
+                                "gateway.model.error_prefix",
+                                error=(
+                                    "One-turn switch (--once) is not supported "
+                                    "for the claude-bridge provider."
+                                ),
+                            )
 
                         try:
                             from hermes_cli.context_switch_guard import (
                                 enrich_model_switch_warnings_for_gateway,
                             )
 
-                            # Offload: merge_preflight_compression_warning()
-                            # calls the sync resolve_display_context_length()
-                            # provider probe ladder — must not run on the loop.
-                            await asyncio.to_thread(
-                                enrich_model_switch_warnings_for_gateway,
-                                result,
-                                _self,
-                                session_key=_session_key,
-                                source=event.source,
-                                custom_providers=custom_provs,
-                                load_gateway_config=_load_gateway_config,
-                            )
+                            if result.target_provider != CLAUDE_BRIDGE_PROVIDER_ID:
+                                # Offload: merge_preflight_compression_warning()
+                                # calls the sync resolve_display_context_length()
+                                # provider probe ladder — must not run on the loop.
+                                await asyncio.to_thread(
+                                    enrich_model_switch_warnings_for_gateway,
+                                    result,
+                                    _self,
+                                    session_key=_session_key,
+                                    source=event.source,
+                                    custom_providers=custom_provs,
+                                    load_gateway_config=_load_gateway_config,
+                                )
                         except Exception as exc:
                             logger.debug("preflight-compression switch warning failed: %s", exc)
 
@@ -1862,7 +1892,11 @@ class GatewaySlashCommandsMixin:
                         if _cache_lock and _cache is not None:
                             with _cache_lock:
                                 cached_entry = _cache.get(_session_key)
-                        if cached_entry and cached_entry[0] is not None:
+                        if (
+                            result.target_provider != CLAUDE_BRIDGE_PROVIDER_ID
+                            and cached_entry
+                            and cached_entry[0] is not None
+                        ):
                             try:
                                 cached_entry[0].switch_model(
                                     new_model=result.new_model,
@@ -2029,21 +2063,23 @@ class GatewaySlashCommandsMixin:
                             pass
                         if not isinstance(_sw_model_cfg, dict):
                             _sw_model_cfg = {}
-                        ctx = await resolve_display_context_length_async(
-                            result.new_model,
-                            result.target_provider,
-                            base_url=result.base_url or current_base_url or "",
-                            api_key=result.api_key or current_api_key or "",
-                            model_info=mi,
-                            custom_providers=custom_provs,
-                            config_context_length=_sw_config_ctx,
-                            configured_model=(
-                                _sw_model_cfg.get("default")
-                                or _sw_model_cfg.get("model")
-                            ),
-                            configured_provider=_sw_model_cfg.get("provider"),
-                            configured_base_url=_sw_model_cfg.get("base_url"),
-                        )
+                        ctx = None
+                        if result.target_provider != CLAUDE_BRIDGE_PROVIDER_ID:
+                            ctx = await resolve_display_context_length_async(
+                                result.new_model,
+                                result.target_provider,
+                                base_url=result.base_url or current_base_url or "",
+                                api_key=result.api_key or current_api_key or "",
+                                model_info=mi,
+                                custom_providers=custom_provs,
+                                config_context_length=_sw_config_ctx,
+                                configured_model=(
+                                    _sw_model_cfg.get("default")
+                                    or _sw_model_cfg.get("model")
+                                ),
+                                configured_provider=_sw_model_cfg.get("provider"),
+                                configured_base_url=_sw_model_cfg.get("base_url"),
+                            )
                         if ctx:
                             lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
                         if mi:
@@ -2052,6 +2088,10 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
+                        if _crosses_claude_bridge(
+                            _cur_provider, result.target_provider
+                        ):
+                            lines.append(_CLAUDE_BRIDGE_CONTEXT_NOTICE)
                         if persist_global:
                             lines.append(t("gateway.model.saved_global"))
                         else:
@@ -2100,6 +2140,7 @@ class GatewaySlashCommandsMixin:
                     user_providers=user_provs,
                     custom_providers=custom_provs,
                     max_models=5,
+                    include_claude_bridge=claude_bridge_enabled,
                     excluded_providers=excluded_provs,
                 )
                 for p in providers:
@@ -2139,28 +2180,44 @@ class GatewaySlashCommandsMixin:
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            allow_claude_bridge=claude_bridge_enabled,
         )
 
         if not result.success:
             return t("gateway.model.error_prefix", error=result.error_message)
+        if one_turn and (
+            str(current_provider or "").strip().lower()
+            == CLAUDE_BRIDGE_PROVIDER_ID
+            or result.target_provider == CLAUDE_BRIDGE_PROVIDER_ID
+        ):
+            # Bridge turns bypass the native finally block that restores
+            # one-turn model overrides.
+            return t(
+                "gateway.model.error_prefix",
+                error=(
+                    "One-turn switch (--once) is not supported "
+                    "for the claude-bridge provider."
+                ),
+            )
 
         try:
             from hermes_cli.context_switch_guard import (
                 enrich_model_switch_warnings_for_gateway,
             )
 
-            # Offload: merge_preflight_compression_warning() calls the sync
-            # resolve_display_context_length() provider probe ladder — must
-            # not run on the loop.
-            await asyncio.to_thread(
-                enrich_model_switch_warnings_for_gateway,
-                result,
-                self,
-                session_key=session_key,
-                source=source,
-                custom_providers=custom_provs,
-                load_gateway_config=_load_gateway_config,
-            )
+            if result.target_provider != CLAUDE_BRIDGE_PROVIDER_ID:
+                # Offload: merge_preflight_compression_warning() calls the sync
+                # resolve_display_context_length() provider probe ladder — must
+                # not run on the loop.
+                await asyncio.to_thread(
+                    enrich_model_switch_warnings_for_gateway,
+                    result,
+                    self,
+                    session_key=session_key,
+                    source=source,
+                    custom_providers=custom_provs,
+                    load_gateway_config=_load_gateway_config,
+                )
         except Exception as exc:
             logger.debug("preflight-compression switch warning failed: %s", exc)
 
@@ -2174,7 +2231,11 @@ class GatewaySlashCommandsMixin:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
 
-            if cached_entry and cached_entry[0] is not None:
+            if (
+                result.target_provider != CLAUDE_BRIDGE_PROVIDER_ID
+                and cached_entry
+                and cached_entry[0] is not None
+            ):
                 try:
                     cached_entry[0].switch_model(
                         new_model=result.new_model,
@@ -2355,21 +2416,23 @@ class GatewaySlashCommandsMixin:
                 pass
             if not isinstance(_sw2_model_cfg, dict):
                 _sw2_model_cfg = {}
-            ctx = await resolve_display_context_length_async(
-                result.new_model,
-                result.target_provider,
-                base_url=result.base_url or current_base_url or "",
-                api_key=result.api_key or current_api_key or "",
-                model_info=mi,
-                custom_providers=custom_provs,
-                config_context_length=_sw2_config_ctx,
-                configured_model=(
-                    _sw2_model_cfg.get("default")
-                    or _sw2_model_cfg.get("model")
-                ),
-                configured_provider=_sw2_model_cfg.get("provider"),
-                configured_base_url=_sw2_model_cfg.get("base_url"),
-            )
+            ctx = None
+            if result.target_provider != CLAUDE_BRIDGE_PROVIDER_ID:
+                ctx = await resolve_display_context_length_async(
+                    result.new_model,
+                    result.target_provider,
+                    base_url=result.base_url or current_base_url or "",
+                    api_key=result.api_key or current_api_key or "",
+                    model_info=mi,
+                    custom_providers=custom_provs,
+                    config_context_length=_sw2_config_ctx,
+                    configured_model=(
+                        _sw2_model_cfg.get("default")
+                        or _sw2_model_cfg.get("model")
+                    ),
+                    configured_provider=_sw2_model_cfg.get("provider"),
+                    configured_base_url=_sw2_model_cfg.get("base_url"),
+                )
             if ctx:
                 lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
             if mi:
@@ -2387,6 +2450,9 @@ class GatewaySlashCommandsMixin:
 
             if result.warning_message:
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
+
+            if _crosses_claude_bridge(current_provider, result.target_provider):
+                lines.append(_CLAUDE_BRIDGE_CONTEXT_NOTICE)
 
             if persist_global:
                 lines.append(t("gateway.model.saved_global"))
@@ -2407,14 +2473,15 @@ class GatewaySlashCommandsMixin:
         try:
             from hermes_cli.model_cost_guard import expensive_model_warning
 
-            _cost_warning = await asyncio.to_thread(
-                expensive_model_warning,
-                result.new_model,
-                provider=result.target_provider,
-                base_url=result.base_url or current_base_url or "",
-                api_key=result.api_key or current_api_key or "",
-                model_info=result.model_info,
-            )
+            if result.target_provider != CLAUDE_BRIDGE_PROVIDER_ID:
+                _cost_warning = await asyncio.to_thread(
+                    expensive_model_warning,
+                    result.new_model,
+                    provider=result.target_provider,
+                    base_url=result.base_url or current_base_url or "",
+                    api_key=result.api_key or current_api_key or "",
+                    model_info=result.model_info,
+                )
         except Exception:
             _cost_warning = None
         if _cost_warning is not None:

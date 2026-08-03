@@ -17,6 +17,7 @@ from gateway.config import ClaudeBridgeConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from hermes_cli.providers import CLAUDE_BRIDGE_PROVIDER_ID
 
 
 def _event(text="hello claude", user_id="user1", chat_type="dm", chat_id="c1"):
@@ -116,11 +117,34 @@ class TestClaudeBridgeHandlerAuthorization:
         assert seen == ["hi"]
 
     @pytest.mark.asyncio
-    async def test_select_message_handler_routes_through_auth_gate_when_enabled(self):
+    async def test_select_message_handler_returns_dynamic_router_when_enabled(self):
         runner, _adapter = _make_runner()
         handler = runner._select_message_handler()
-        assert handler == runner._claude_bridge_handler
+        assert handler == runner._route_message
         assert handler != runner.claude_bridge.handle_message
+
+    @pytest.mark.parametrize("provider", [CLAUDE_BRIDGE_PROVIDER_ID, "ollama-launch"])
+    @pytest.mark.asyncio
+    async def test_dynamic_router_preserves_authorization_gate_for_both_paths(
+        self, monkeypatch, provider
+    ):
+        runner, adapter = _make_runner()
+        runner._resolve_effective_message_provider = lambda _source: provider
+        runner._scale_to_zero_note_real_inbound = lambda: None
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook", lambda *args, **kwargs: []
+        )
+        runner.claude_bridge.handle_message = AsyncMock(
+            side_effect=AssertionError("unauthorized sender reached the bridge")
+        )
+
+        reply = await runner._select_message_handler()(
+            _event(user_id="stranger")
+        )
+
+        assert reply is None
+        adapter.send.assert_awaited_once()
+        runner.claude_bridge.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_slack_ignored_channel_dropped_before_bridge(self):

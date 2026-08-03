@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from typing import Any, List, NamedTuple, Optional
 
 from hermes_cli.providers import (
+    CLAUDE_BRIDGE_MODEL_ID,
+    CLAUDE_BRIDGE_PROVIDER_ID,
     ProviderDef,
     custom_provider_aliases,
     custom_provider_slug,
@@ -1214,6 +1216,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    allow_claude_bridge: bool = False,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1248,6 +1251,7 @@ def switch_model(
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.
+        allow_claude_bridge: Whether the gateway-only virtual provider is available.
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -1300,7 +1304,9 @@ def switch_model(
             )
 
         target_provider = pdef.id
-        if target_provider == "moa" and not new_model:
+        if target_provider == CLAUDE_BRIDGE_PROVIDER_ID:
+            new_model = CLAUDE_BRIDGE_MODEL_ID
+        elif target_provider == "moa" and not new_model:
             try:
                 from hermes_cli.config import load_config
                 from hermes_cli.moa_config import normalize_moa_config
@@ -1573,6 +1579,27 @@ def switch_model(
         )
         if custom_pdef is not None:
             provider_label = custom_pdef.name
+
+    if target_provider == CLAUDE_BRIDGE_PROVIDER_ID:
+        if not allow_claude_bridge:
+            return ModelSwitchResult(
+                success=False,
+                target_provider=target_provider,
+                provider_label=provider_label,
+                is_global=is_global,
+                error_message=(
+                    "Provider 'claude-bridge' is unavailable because "
+                    "claude_bridge.enabled is false."
+                ),
+            )
+        return ModelSwitchResult(
+            success=True,
+            new_model=CLAUDE_BRIDGE_MODEL_ID,
+            target_provider=target_provider,
+            provider_changed=provider_changed,
+            provider_label=provider_label,
+            is_global=is_global,
+        )
 
     # --- Resolve credentials ---
     api_key = current_api_key
@@ -1930,6 +1957,7 @@ def list_authenticated_providers(
     probe_current_custom_provider: bool = False,
     for_picker: bool = False,
     excluded_providers: list | None = None,
+    include_claude_bridge: bool = False,
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
 
@@ -1946,7 +1974,8 @@ def list_authenticated_providers(
       - total_models: int — total curated count
       - source: str — "built-in", "models.dev", "user-config"
 
-    Only includes providers that have API keys set or are user-defined endpoints.
+    Only includes providers that have API keys set or are user-defined endpoints,
+    plus the virtual Claude Bridge row when ``include_claude_bridge`` is true.
     ``force_fresh_nous_tier`` bypasses the short Nous tier cache for explicit
     account-sensitive flows. UI picker opens should leave it false so they do
     not block on fresh Portal/account checks every time.
@@ -3066,6 +3095,27 @@ def list_authenticated_providers(
     except Exception:
         pass
 
+    if (
+        include_claude_bridge
+        and CLAUDE_BRIDGE_PROVIDER_ID not in _excluded
+        and not any(
+            str(row.get("slug", "")).strip().lower()
+            == CLAUDE_BRIDGE_PROVIDER_ID
+            for row in results
+        )
+    ):
+        results.append(
+            {
+                "slug": CLAUDE_BRIDGE_PROVIDER_ID,
+                "name": get_label(CLAUDE_BRIDGE_PROVIDER_ID),
+                "is_current": _current_provider_norm == CLAUDE_BRIDGE_PROVIDER_ID,
+                "is_user_defined": False,
+                "models": [CLAUDE_BRIDGE_MODEL_ID],
+                "total_models": 1,
+                "source": "virtual",
+            }
+        )
+
     # Surface a custom / uncurated model the user selected via the CLI.
     # Each row's model list is its curated/live catalog, so a model the user set
     # with `/model <provider>/<uncurated-name>` would otherwise be invisible in
@@ -3078,6 +3128,8 @@ def list_authenticated_providers(
         for _row in results:
             if not _row.get("is_current"):
                 continue
+            if _row.get("slug") == CLAUDE_BRIDGE_PROVIDER_ID:
+                break
             _models = _row.get("models") or []
             if current_model not in _models:
                 _row["models"] = [current_model, *_models]
@@ -3119,6 +3171,7 @@ def list_picker_providers(
     current_model: str = "",
     include_moa: bool = False,
     excluded_providers: list | None = None,
+    include_claude_bridge: bool = False,
 ) -> List[dict]:
     """Interactive-picker variant of :func:`list_authenticated_providers`.
 
@@ -3149,6 +3202,7 @@ def list_picker_providers(
         max_models=max_models,
         current_model=current_model,
         for_picker=True,
+        include_claude_bridge=include_claude_bridge,
         excluded_providers=excluded_providers,
     )
     if include_moa:

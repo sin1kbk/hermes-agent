@@ -814,7 +814,7 @@ class ClaudeBridge:
         await self._discard_all_processes(intentional_stop=True)
 
     async def handle_message(self, event: MessageEvent) -> Optional[str]:
-        """Gateway ``MessageHandler``: replaces ``_handle_message`` when enabled."""
+        """Gateway ``MessageHandler`` for sessions routed to this provider."""
         text = (event.text or "").strip()
 
         if text == "!halt":

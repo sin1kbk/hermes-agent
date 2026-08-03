@@ -62,6 +62,7 @@ from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.providers import CLAUDE_BRIDGE_PROVIDER_ID
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -13730,16 +13731,109 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Every message path (``_primary_message_handler`` behind the initial
         connect and reconnect registration sites, the multiplex
         default-profile wrapper, and the per-profile wrappers) routes through
-        here so the Claude bridge opt-in has exactly one switch.
-        ``claude_bridge.enabled=False``
-        (the default) always returns ``self._handle_message`` unchanged.
-        ``_claude_bridge_handler`` (not ``self.claude_bridge.handle_message``
-        directly) applies the same pairing/allowlist gate as
-        ``_handle_message`` — see ``_gate_unauthorized_message``.
+        here. The returned router resolves the effective provider for every
+        message, so a session-scoped ``/model`` switch takes effect without
+        reconnecting an adapter.
         """
-        if self.claude_bridge.enabled:
-            return self._claude_bridge_handler
-        return self._handle_message
+        return self._route_message
+
+    def _resolve_effective_message_provider(self, source: SessionSource) -> str:
+        """Resolve provider as session override, channel override, then config."""
+        normalized_source = self._normalize_source_for_session_key(source)
+        session_key = self._session_key_for_source(normalized_source)
+        self._rehydrate_session_model_override(session_key)
+
+        state = self._peek_session_state(session_key)
+        session_override = (
+            state.conversation.model_override if state is not None else None
+        )
+        if isinstance(session_override, dict):
+            provider = str(session_override.get("provider") or "").strip().lower()
+            if provider:
+                return provider
+
+        config = getattr(self, "config", None)
+        if isinstance(getattr(config, "platforms", None), dict):
+            channel_override = _get_channel_override(
+                config,
+                normalized_source.platform,
+                str(normalized_source.chat_id or ""),
+                thread_id=(
+                    str(getattr(normalized_source, "thread_id", ""))
+                    if getattr(normalized_source, "thread_id", None)
+                    else None
+                ),
+                parent_id=(
+                    str(getattr(normalized_source, "parent_chat_id", ""))
+                    if getattr(normalized_source, "parent_chat_id", None)
+                    else None
+                ),
+            )
+            provider = str(
+                getattr(channel_override, "provider", "") or ""
+            ).strip().lower()
+            if provider:
+                return provider
+
+        try:
+            runtime_config = _load_gateway_runtime_config()
+        except Exception:
+            logger.warning(
+                "Failed to load model.provider for message routing: "
+                "session_key=%s platform=%s chat_id=%s",
+                session_key,
+                normalized_source.platform,
+                normalized_source.chat_id,
+                exc_info=True,
+            )
+            return ""
+        model_config = runtime_config.get("model", {})
+        if not isinstance(model_config, dict):
+            return ""
+        return str(model_config.get("provider") or "").strip().lower()
+
+    def _is_model_switch_command(self, event: MessageEvent) -> bool:
+        """Return whether a command must be handled by the native model switcher."""
+        command = event.get_command()
+        if not command:
+            return False
+
+        from hermes_cli.commands import resolve_command
+
+        command_def = resolve_command(command)
+        if command_def is not None:
+            return command_def.name == "model"
+
+        if isinstance(self.config, dict):
+            quick_commands = self.config.get("quick_commands", {}) or {}
+        else:
+            quick_commands = getattr(self.config, "quick_commands", {}) or {}
+        if not isinstance(quick_commands, dict):
+            return False
+
+        quick_command = quick_commands.get(command)
+        if not isinstance(quick_command, dict) or quick_command.get("type") != "alias":
+            return False
+
+        target = (quick_command.get("target") or "").strip()
+        target_command = target.lstrip("/").split(maxsplit=1)[0] if target else ""
+        target_def = resolve_command(target_command) if target_command else None
+        return target_def is not None and target_def.name == "model"
+
+    async def _route_message(self, event: MessageEvent) -> Optional[str]:
+        """Dispatch one message to the bridge or the native agent loop."""
+        if not self.claude_bridge.enabled:
+            return await self._handle_message(event)
+
+        provider = await asyncio.to_thread(
+            self._resolve_effective_message_provider,
+            event.source,
+        )
+        if self._is_model_switch_command(event):
+            return await self._handle_message(event)
+        if provider == CLAUDE_BRIDGE_PROVIDER_ID:
+            return await self._claude_bridge_handler(event)
+        return await self._handle_message(event)
 
     def _bind_claude_bridge_notifier(self, adapter: Optional[Any] = None) -> None:
         """Give the bridge somewhere to post turns Claude ran unprompted.
@@ -13915,7 +14009,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _claude_bridge_handler(self, event: MessageEvent) -> Optional[str]:
-        """Authorization-gated entry point used when the Claude bridge is on.
+        """Authorization-gated entry point used when the bridge provider is active.
 
         ``ClaudeBridge.handle_message`` is deliberately platform/auth-agnostic
         (no ``GatewayRunner`` reference — see gateway/claude_bridge.py) so it

@@ -28,6 +28,10 @@ from utils import base_url_host_matches, base_url_hostname
 logger = logging.getLogger(__name__)
 
 
+CLAUDE_BRIDGE_PROVIDER_ID = "claude-bridge"
+CLAUDE_BRIDGE_MODEL_ID = "claude-code"
+
+
 # -- Hermes overlay ----------------------------------------------------------
 # Hermes-specific metadata that models.dev doesn't provide.
 
@@ -44,6 +48,10 @@ class HermesOverlay:
 
 
 HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
+    CLAUDE_BRIDGE_PROVIDER_ID: HermesOverlay(
+        transport="openai_chat",
+        auth_type="virtual",
+    ),
     "moa": HermesOverlay(
         transport="openai_chat",
         auth_type="virtual",
@@ -400,6 +408,7 @@ ALIASES: Dict[str, str] = {
 # not in the catalog.
 
 _LABEL_OVERRIDES: Dict[str, str] = {
+    CLAUDE_BRIDGE_PROVIDER_ID: "Claude Bridge",
     "moa": "Mixture of Agents",
     "nous": "Nous Portal",
     "openai-codex": "OpenAI Codex",

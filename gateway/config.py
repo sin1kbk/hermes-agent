@@ -828,11 +828,10 @@ DEFAULT_CLAUDE_PERMISSION_MODE = "auto"
 
 @dataclass
 class ClaudeBridgeConfig:
-    """Configuration for routing inbound messages to a spawned Claude Code CLI.
+    """Configuration for exposing the Claude Code CLI bridge provider.
 
-    When ``enabled`` is False (the default), the gateway's normal agent loop
-    handles every message and this config is inert — no behavior difference
-    from before the bridge existed.
+    When ``enabled`` is False (the default), the provider is unavailable and
+    the gateway's normal agent loop handles every message.
     """
     enabled: bool = False
     # cwd for the spawned `claude` process. Required when enabled (validated
@@ -1092,7 +1091,7 @@ class GatewayConfig:
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
 
-    # Claude Code CLI bridge (opt-in; default off preserves the built-in agent loop).
+    # Claude Code CLI bridge provider (opt-in; unavailable when disabled).
     claude_bridge: ClaudeBridgeConfig = field(default_factory=ClaudeBridgeConfig)
 
     # Session store pruning: drop SessionEntry records older than this many
