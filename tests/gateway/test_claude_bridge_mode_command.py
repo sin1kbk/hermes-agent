@@ -1,4 +1,4 @@
-"""Regression tests for the bridge's /mode permission-mode command.
+"""Regression tests for the bridge's /mode and /yolo permission-mode commands.
 
 The mode is a spawn flag, so a switch is only observable on the argv of the
 next `claude -p` process.  These tests assert on that argv wherever the
@@ -336,6 +336,104 @@ async def test_mode_change_is_logged_with_sender(hermes_home, monkeypatch, caplo
 
     assert "u1" in caplog.text
     assert "bypassPermissions" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_yolo_switches_to_bypass_on_the_next_spawn(hermes_home, monkeypatch):
+    spawn = _spawn_mock(monkeypatch)
+    bridge = _bridge(hermes_home)
+
+    reply = await bridge.handle_message(_event("/yolo"))
+    await bridge.handle_message(_event("hello"))
+
+    assert "bypassPermissions" in reply
+    assert _spawned_mode(spawn.call_args) == "bypassPermissions"
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_yolo_toggles_back_to_the_default(hermes_home, monkeypatch):
+    spawn = _spawn_mock(monkeypatch)
+    bridge = _bridge(hermes_home)
+
+    await bridge.handle_message(_event("/yolo"))
+    reply = await bridge.handle_message(_event("/yolo"))
+    await bridge.handle_message(_event("hello"))
+
+    assert bridge._mode_overrides == {}
+    assert "auto" in reply
+    assert _spawned_mode(spawn.call_args) == "auto"
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_yolo_off_reports_that_the_default_still_bypasses(hermes_home, monkeypatch):
+    """Clearing the override cannot go below a bypassing configured default."""
+    _never_spawn(monkeypatch)
+    bridge = _bridge(hermes_home, default_permission_mode="bypassPermissions")
+
+    reply = await bridge.handle_message(_event("/yolo"))
+
+    assert bridge._mode_overrides == {}
+    assert "still bypasses" in reply
+
+
+@pytest.mark.asyncio
+async def test_yolo_is_rejected_when_bypass_is_not_allowed(hermes_home, monkeypatch, caplog):
+    _never_spawn(monkeypatch)
+    bridge = _bridge(hermes_home, allowed_permission_modes=["auto", "plan"])
+
+    with caplog.at_level(logging.WARNING, logger="gateway.claude_bridge"):
+        reply = await bridge.handle_message(_event("/yolo", user_id="u1"))
+
+    assert "bypassPermissions" in reply
+    assert bridge._mode_overrides == {}
+    # Every rejection is an audit-log entry, as it is for /mode.
+    assert "u1" in caplog.text
+    assert "not allowed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_yolo_cannot_read_the_allowed_modes(hermes_home, monkeypatch):
+    """The rejection must not differ by config: that would leak the mode list."""
+    _never_spawn(monkeypatch)
+    narrow = _bridge(hermes_home, halt_users=["u2"], allowed_permission_modes=["auto"])
+    wide = _bridge(hermes_home, halt_users=["u2"])
+
+    narrow_reply = await narrow.handle_message(_event("/yolo", user_id="u1"))
+    wide_reply = await wide.handle_message(_event("/yolo", user_id="u1"))
+
+    assert narrow_reply == wide_reply
+    assert "Not authorized" in narrow_reply
+
+
+@pytest.mark.asyncio
+async def test_yolo_requires_authorization(hermes_home, monkeypatch, caplog):
+    _never_spawn(monkeypatch)
+    bridge = _bridge(hermes_home, halt_users=["u2"])
+
+    with caplog.at_level(logging.WARNING, logger="gateway.claude_bridge"):
+        reply = await bridge.handle_message(_event("/yolo", user_id="u1"))
+
+    assert "Not authorized" in reply
+    assert bridge._mode_overrides == {}
+    assert "u1" in caplog.text
+    assert "unauthorized" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_yolo_replaces_the_resident_process(hermes_home, monkeypatch):
+    """The mode is a spawn flag, so the running CLI must not survive the switch."""
+    spawn = _spawn_mock(monkeypatch, count=2)
+    bridge = _bridge(hermes_home)
+
+    await bridge.handle_message(_event("hello"))
+    await bridge.handle_message(_event("/yolo"))
+    await bridge.handle_message(_event("hello again"))
+
+    assert _spawned_mode(spawn.call_args_list[0]) == "auto"
+    assert _spawned_mode(spawn.call_args_list[1]) == "bypassPermissions"
+    await bridge.close()
 
 
 def test_config_round_trips_permission_mode_settings():

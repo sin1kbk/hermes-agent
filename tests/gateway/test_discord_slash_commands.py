@@ -233,6 +233,34 @@ async def test_plugin_command_name_conflict_skipped(adapter):
 
 
 # ------------------------------------------------------------------
+# /yolo — native tree and relay manifest must agree
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_registers_native_yolo_slash_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["yolo"](interaction)
+
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/yolo")
+
+
+def test_relay_manifest_declares_yolo_like_the_native_tree():
+    """The relay lane mirrors the native tree, so a command added to one
+    without the other gives a hosted deployment a different palette."""
+    from gateway.relay.command_manifest import build_relay_command_manifest
+
+    entry = next(
+        e for e in build_relay_command_manifest() if e["name"] == "yolo"
+    )
+
+    assert entry.get("options") is None
+
+
+# ------------------------------------------------------------------
 # 100-command cap (Discord error 30032 guard)
 # ------------------------------------------------------------------
 

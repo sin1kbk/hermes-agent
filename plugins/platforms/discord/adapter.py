@@ -5507,6 +5507,10 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_deny(interaction: discord.Interaction, scope: str = ""):
             await self._run_simple_slash(interaction, f"/deny {scope}".strip())
 
+        @tree.command(name="yolo", description="Toggle skipping approval prompts")
+        async def slash_yolo(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/yolo")
+
         @tree.command(name="thread", description="Create a new thread and start a Hermes session in it")
         @discord.app_commands.describe(
             name="Thread name",
