@@ -69,6 +69,7 @@ class TestReasoningCommand:
     def test_parse_reasoning_command_args_accepts_ascii_and_smart_global_flags(self):
         assert gateway_run.GatewayRunner._parse_reasoning_command_args("high --global") == ("high", True)
         assert gateway_run.GatewayRunner._parse_reasoning_command_args("—global xhigh") == ("xhigh", True)
+        assert gateway_run.GatewayRunner._parse_reasoning_command_args("high --session") == ("high", False)
 
     @pytest.mark.asyncio
     async def test_reasoning_command_reloads_current_state_from_config(self, tmp_path, monkeypatch):
@@ -115,6 +116,48 @@ class TestReasoningCommand:
         assert runner._session_reasoning_overrides[session_key] == {
             "enabled": True,
             "effort": effort,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("effort", ["minimal", "ultra", "none"])
+    async def test_claude_bridge_rejects_unsupported_reasoning_efforts(
+        self, tmp_path, monkeypatch, effort
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "model:\n  provider: claude-bridge\n  default: claude-opus-5\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        runner = _make_runner()
+        event = _make_event(f"/reasoning {effort}")
+        session_key = runner._session_key_for_source(event.source)
+
+        result = await runner._handle_reasoning_command(event)
+
+        assert "Claude Bridge supports only" in result
+        assert session_key not in runner._session_reasoning_overrides
+
+    @pytest.mark.asyncio
+    async def test_native_provider_keeps_accepting_minimal_reasoning(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "model:\n  provider: ollama-launch\n  default: qwen\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        runner = _make_runner()
+        event = _make_event("/reasoning minimal")
+        session_key = runner._session_key_for_source(event.source)
+
+        await runner._handle_reasoning_command(event)
+
+        assert runner._session_reasoning_overrides[session_key] == {
+            "enabled": True,
+            "effort": "minimal",
         }
 
 
@@ -217,4 +260,3 @@ class TestLoadShowReasoningCoercion:
             tmp_path, monkeypatch,
             'display:\n  show_reasoning: true\n',
         ) is True
-

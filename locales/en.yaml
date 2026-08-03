@@ -213,6 +213,7 @@ gateway:
     reset_global_unsupported:  "⚠️ `/reasoning reset --global` is not supported. Use `/reasoning <level> --global` to change the global default."
     reset_done:                "🧠 ✓ Session reasoning override cleared; falling back to global config."
     unknown_arg:               "⚠️ Unknown argument: `{arg}`\n\n**Valid levels:** none, minimal, low, medium, high, xhigh, max, ultra\n**Display:** show, hide\n**Persist:** add `--global` to save beyond this session"
+    claude_bridge_unsupported_effort: "⚠️ Claude Bridge supports only: low, medium, high, xhigh, max. `{effort}` was not saved."
     picker_title:              "🧠 **Reasoning Settings**\n\n**Effort:** `{level}`\n**Scope:** {scope}\n**Display:** {display}\n\nPick an option:"
     choice_none:               "none — disable reasoning"
     choice_reset:              "reset — clear session override"

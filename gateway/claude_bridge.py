@@ -33,7 +33,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from gateway.config import ClaudeBridgeConfig
 from gateway.platforms.base import MessageEvent
-from hermes_cli.providers import CLAUDE_BRIDGE_MODEL_ID
+from hermes_cli.providers import (
+    CLAUDE_BRIDGE_MODEL_ID,
+    CLAUDE_BRIDGE_REASONING_EFFORTS,
+)
 from hermes_constants import get_hermes_home
 from utils import atomic_replace
 
@@ -60,6 +63,11 @@ _SECRET_NAME_FRAGMENTS = (
 def _normalize_bridge_model(model: object) -> str:
     value = model.strip() if isinstance(model, str) else ""
     return "" if value.lower() == CLAUDE_BRIDGE_MODEL_ID else value
+
+
+def _normalize_bridge_effort(effort: object) -> str:
+    value = effort.strip().lower() if isinstance(effort, str) else ""
+    return value if value in CLAUDE_BRIDGE_REASONING_EFFORTS else ""
 
 
 def _bridge_home() -> Path:
@@ -255,6 +263,7 @@ class _ClaudeProcess:
         resume_session_id: Optional[str],
         extra_args: List[str],
         model: str = "",
+        effort: str = "",
         on_unsolicited_result: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self._claude_bin = claude_bin
@@ -262,6 +271,7 @@ class _ClaudeProcess:
         self._resume_session_id = resume_session_id
         self._extra_args = list(extra_args)
         self.model = _normalize_bridge_model(model)
+        self.effort = _normalize_bridge_effort(effort)
         self._on_unsolicited_result = on_unsolicited_result
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
@@ -304,6 +314,8 @@ class _ClaudeProcess:
         args += self._extra_args
         if self.model:
             args += ["--model", self.model]
+        if self.effort:
+            args += ["--effort", self.effort]
 
         try:
             # The gateway's environment carries every injected secret (bot
@@ -742,21 +754,35 @@ class ClaudeBridge:
         )
 
     async def _get_or_spawn_process(
-        self, key: str, resume_session_id: Optional[str], model: str
+        self, key: str, resume_session_id: Optional[str], model: str, effort: str
     ) -> tuple[Optional[_ClaudeProcess], Optional[_SpawnOutcome]]:
         model = _normalize_bridge_model(model)
+        effort = _normalize_bridge_effort(effort)
         existing = self._procs.get(key)
         if existing is not None and existing.is_alive:
             existing.model = _normalize_bridge_model(existing.model)
-            if existing.model == model:
+            existing.effort = _normalize_bridge_effort(existing.effort)
+            if existing.model == model and existing.effort == effort:
                 return existing, None
         if existing is not None and existing.is_alive:
-            logger.info(
-                "claude_bridge: model changed for %s (%s -> %s); respawning",
-                key,
-                existing.model,
-                model,
-            )
+            model_changed = existing.model != model
+            effort_changed = existing.effort != effort
+            if model_changed and effort_changed:
+                logger.info(
+                    "claude_bridge: model and effort changed for %s "
+                    "(model %s -> %s; effort %s -> %s); respawning",
+                    key, existing.model, model, existing.effort, effort,
+                )
+            elif model_changed:
+                logger.info(
+                    "claude_bridge: model changed for %s (%s -> %s); respawning",
+                    key, existing.model, model,
+                )
+            else:
+                logger.info(
+                    "claude_bridge: effort changed for %s (%s -> %s); respawning",
+                    key, existing.effort, effort,
+                )
         if existing is not None:
             await self._discard_process(key, existing)
 
@@ -775,6 +801,7 @@ class ClaudeBridge:
                 self._effective_mode(key),
             ],
             model=model,
+            effort=effort,
             on_unsolicited_result=(
                 lambda event, key=key: self._handle_unsolicited_result(key, event)
             ),
@@ -835,10 +862,11 @@ class ClaudeBridge:
         await self._discard_all_processes(intentional_stop=True)
 
     async def handle_message(
-        self, event: MessageEvent, *, model: str = ""
+        self, event: MessageEvent, *, model: str = "", effort: str = ""
     ) -> Optional[str]:
         """Gateway ``MessageHandler`` for sessions routed to this provider."""
         model = _normalize_bridge_model(model)
+        effort = _normalize_bridge_effort(effort)
         text = (event.text or "").strip()
 
         if text == "!halt":
@@ -896,7 +924,7 @@ class ClaudeBridge:
         lock = await self._lock_for(key)
         async with self._semaphore:
             async with lock:
-                return await self._handle_locked(key, text, model)
+                return await self._handle_locked(key, text, model, effort)
 
     async def _handle_mode_command(self, event: MessageEvent, key: str) -> str:
         """``/mode [name|default]`` — read or switch this channel's mode.
@@ -969,11 +997,13 @@ class ClaudeBridge:
             f"{self.config.default_permission_mode}."
         )
 
-    async def _handle_locked(self, key: str, text: str, model: str) -> str:
+    async def _handle_locked(self, key: str, text: str, model: str, effort: str) -> str:
         resume_id = self._sessions.get(key)
         self._turns_in_progress.add(key)
         try:
-            proc, spawn_error = await self._get_or_spawn_process(key, resume_id, model)
+            proc, spawn_error = await self._get_or_spawn_process(
+                key, resume_id, model, effort
+            )
             attempted_resume = proc is not None and proc.is_unproven_resume
             outcome = spawn_error or await proc.send_turn(text, self.config.timeout_seconds)
             self._save_result_session(key, outcome)
@@ -1005,7 +1035,9 @@ class ClaudeBridge:
                 if proc is not None:
                     await self._discard_process(key, proc)
                 self._sessions.clear(key)
-                proc, spawn_error = await self._get_or_spawn_process(key, None, model)
+                proc, spawn_error = await self._get_or_spawn_process(
+                    key, None, model, effort
+                )
                 outcome = spawn_error or await proc.send_turn(text, self.config.timeout_seconds)
                 self._save_result_session(key, outcome)
                 fallback_note = "\n\n(resume failed — started a new Claude session)"

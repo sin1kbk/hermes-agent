@@ -62,7 +62,11 @@ from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
-from hermes_cli.providers import CLAUDE_BRIDGE_MODEL_ID, CLAUDE_BRIDGE_PROVIDER_ID
+from hermes_cli.providers import (
+    CLAUDE_BRIDGE_MODEL_ID,
+    CLAUDE_BRIDGE_PROVIDER_ID,
+    CLAUDE_BRIDGE_REASONING_EFFORTS,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -84,6 +88,22 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+
+
+def _claude_bridge_effort_from_reasoning_config(reasoning_config: object) -> str:
+    """Translate Hermes reasoning state into the Claude Code CLI's subset."""
+    if not isinstance(reasoning_config, dict) or reasoning_config.get("enabled") is not True:
+        return ""
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    if effort in CLAUDE_BRIDGE_REASONING_EFFORTS:
+        return effort
+    if effort:
+        logger.warning(
+            "claude_bridge: ignoring unsupported reasoning effort %r; supported: %s",
+            effort,
+            ", ".join(CLAUDE_BRIDGE_REASONING_EFFORTS),
+        )
+    return ""
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -8013,6 +8033,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for token in tokens:
             if token == "--global":
                 persist_global = True
+            elif token == "--session":
+                # Session scope is the default; accept the explicit spelling
+                # used by /model without treating it as part of the effort.
+                continue
             else:
                 value_tokens.append(token)
         return " ".join(value_tokens).strip().lower(), persist_global
@@ -13812,8 +13836,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         )
 
-    def _is_model_switch_command(self, event: MessageEvent) -> bool:
-        """Return whether a command must be handled by the native model switcher."""
+    def _is_native_command(self, event: MessageEvent, command_name: str) -> bool:
+        """Return whether a command (including a quick alias) targets a native handler."""
         command = event.get_command()
         if not command:
             return False
@@ -13822,7 +13846,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         command_def = resolve_command(command)
         if command_def is not None:
-            return command_def.name == "model"
+            return command_def.name == command_name
 
         if isinstance(self.config, dict):
             quick_commands = self.config.get("quick_commands", {}) or {}
@@ -13838,7 +13862,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         target = (quick_command.get("target") or "").strip()
         target_command = target.lstrip("/").split(maxsplit=1)[0] if target else ""
         target_def = resolve_command(target_command) if target_command else None
-        return target_def is not None and target_def.name == "model"
+        return target_def is not None and target_def.name == command_name
+
+    def _is_model_switch_command(self, event: MessageEvent) -> bool:
+        """Return whether a command must be handled by the native model switcher."""
+        return self._is_native_command(event, "model")
+
+    def _is_reasoning_command(self, event: MessageEvent) -> bool:
+        """Return whether a command must be handled by the native reasoning handler."""
+        return self._is_native_command(event, "reasoning")
 
     async def _route_message(self, event: MessageEvent) -> Optional[str]:
         """Dispatch one message to the bridge or the native agent loop."""
@@ -13853,13 +13885,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             provider, model = resolved_route
         else:
             provider, model = resolved_route, ""
-        if self._is_model_switch_command(event):
+        if self._is_model_switch_command(event) or self._is_reasoning_command(event):
             return await self._handle_message(event)
         if provider == CLAUDE_BRIDGE_PROVIDER_ID:
             model = model.strip() if isinstance(model, str) else ""
             if model.lower() == CLAUDE_BRIDGE_MODEL_ID:
                 model = ""
-            return await self._claude_bridge_handler(event, model=model)
+            reasoning_config = await asyncio.to_thread(
+                self._resolve_session_reasoning_config,
+                source=event.source,
+                model=model,
+            )
+            effort = _claude_bridge_effort_from_reasoning_config(reasoning_config)
+            if not effort:
+                return await self._claude_bridge_handler(event, model=model)
+            return await self._claude_bridge_handler(event, model=model, effort=effort)
         return await self._handle_message(event)
 
     def _bind_claude_bridge_notifier(self, adapter: Optional[Any] = None) -> None:
@@ -14036,7 +14076,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _claude_bridge_handler(
-        self, event: MessageEvent, *, model: str = ""
+        self, event: MessageEvent, *, model: str = "", effort: str = ""
     ) -> Optional[str]:
         """Authorization-gated entry point used when the bridge provider is active.
 
@@ -14085,9 +14125,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         model = model.strip() if isinstance(model, str) else ""
         if model.lower() == CLAUDE_BRIDGE_MODEL_ID:
             model = ""
-        if not model:
+        effort = effort.strip().lower() if isinstance(effort, str) else ""
+        if not model and not effort:
             return await self.claude_bridge.handle_message(event)
-        return await self.claude_bridge.handle_message(event, model=model)
+        return await self.claude_bridge.handle_message(event, model=model, effort=effort)
 
     async def _resolve_async_delegation_session(
         self,
