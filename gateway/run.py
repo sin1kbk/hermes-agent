@@ -13923,8 +13923,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         makes that safe: it applies the exact same gate ``_handle_message``
         does before handing off, so bridge mode can't be used to reach
         ``claude -p`` as an unpaired sender.
+
+        It also mirrors ``_handle_message``'s pre-auth guards that matter on
+        this path: the 🔴 cross-session leak reset (this handler runs in the
+        same per-message ``create_task()`` context and spawns the ``claude``
+        CLI through the same subprocess-env bridge, so inherited foreign
+        ``HERMES_SESSION_*`` ContextVars must be cleared before any spawn) and
+        the Slack ignored-channel drop (``ClaudeBridge`` is platform-agnostic
+        and would otherwise dispatch channels the operator explicitly
+        blacklisted).
         """
-        if not await self._gate_unauthorized_message(event):
+        try:
+            from gateway.session_context import reset_session_vars
+            reset_session_vars()
+        except Exception:
+            logger.debug(
+                "reset_session_vars failed at bridge handler entry", exc_info=True
+            )
+
+        is_internal = bool(getattr(event, "internal", False))
+        source = event.source
+        if (
+            not is_internal
+            and getattr(source, "platform", None) == Platform.SLACK
+            and _is_slack_ignored_channel(
+                getattr(self, "config", None), getattr(source, "chat_id", None)
+            )
+        ):
+            logger.info(
+                "Dropping Slack message from configured ignored channel %s "
+                "(claude_bridge path)",
+                getattr(source, "chat_id", None),
+            )
+            return None
+
+        if not await self._gate_unauthorized_message(event, is_internal=is_internal):
             return None
         return await self.claude_bridge.handle_message(event)
 

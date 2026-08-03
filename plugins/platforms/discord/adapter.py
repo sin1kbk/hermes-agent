@@ -7296,6 +7296,8 @@ class DiscordAdapter(BasePlatformAdapter):
             options=options,
             recommended_id=str(recommended) if recommended else None,
             timeout_seconds=decision.get("timeout_seconds"),
+            allowed_user_ids=self._allowed_user_ids,
+            allowed_role_ids=self._allowed_role_ids,
         )
         msg = await channel.send(embed=embed, view=view)
         view._message = msg  # store for on_timeout expiration editing
@@ -9394,10 +9396,11 @@ def _define_discord_view_classes() -> None:
         writes the answer to ``claude_bridge/decisions/<id>.json`` via
         ``gateway.claude_bridge.write_decision_answer`` for a later resume to
         pick up (see that module's docstring: no ``threading.Event`` /
-        in-process wait, file IPC only). Unanswered clicks are open to
-        anyone; there is no allowlist gate here — the decision itself
-        originates from the bridge's own (already-authorized) working
-        directory, not from an untrusted requester.
+        in-process wait, file IPC only). Auth gating mirrors
+        ``ExecApprovalView``: the decision *content* comes from the bridge's
+        own working directory, but the *answer* steers a running Claude
+        session, so the clicker must pass the same user/role/pairing
+        allowlist as every other component view.
         """
 
         def __init__(
@@ -9406,10 +9409,14 @@ def _define_discord_view_classes() -> None:
             options: List[Dict[str, Any]],
             recommended_id: Optional[str],
             timeout_seconds: Optional[float],
+            allowed_user_ids: Optional[set] = None,
+            allowed_role_ids: Optional[set] = None,
         ):
             has_timeout = isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0
             super().__init__(timeout=float(timeout_seconds) if has_timeout else None)
             self.decision_id = decision_id
+            self.allowed_user_ids = allowed_user_ids or set()
+            self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
 
             for opt in options[:25]:
@@ -9434,6 +9441,13 @@ def _define_discord_view_classes() -> None:
         async def _answer(
             self, interaction: "discord.Interaction", opt_id: str, label: str,
         ) -> None:
+            if not _component_check_auth(
+                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            ):
+                await interaction.response.send_message(
+                    "You're not authorized to answer this decision~", ephemeral=True,
+                )
+                return
             if self.resolved:
                 await interaction.response.send_message(
                     "This decision has already been answered~", ephemeral=True,

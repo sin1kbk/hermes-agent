@@ -7,6 +7,7 @@ gateway auth state), skipping the unauthorized-sender handling that
 ``_handle_message`` applies. An unpaired sender could reach ``claude -p``.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -120,3 +121,39 @@ class TestClaudeBridgeHandlerAuthorization:
         handler = runner._select_message_handler()
         assert handler == runner._claude_bridge_handler
         assert handler != runner.claude_bridge.handle_message
+
+    @pytest.mark.asyncio
+    async def test_slack_ignored_channel_dropped_before_bridge(self):
+        """The runner-level Slack ignored-channel guard (#51899) must hold on
+        the bridge path too — ``ClaudeBridge`` is platform-agnostic and has
+        no channel blacklist of its own."""
+        runner, adapter = _make_runner()
+        runner.config = SimpleNamespace(
+            platforms={
+                Platform.SLACK: SimpleNamespace(extra={"ignored_channels": ["C999"]})
+            }
+        )
+        called = False
+
+        async def _fail_handle(event):
+            nonlocal called
+            called = True
+            raise AssertionError("ignored Slack channel must not reach claude_bridge")
+
+        runner.claude_bridge.handle_message = _fail_handle
+
+        event = MessageEvent(
+            text="hello",
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C999",
+                chat_type="group",
+                user_id="user1",
+            ),
+        )
+
+        reply = await runner._claude_bridge_handler(event)
+
+        assert reply is None
+        assert called is False
+        adapter.send.assert_not_awaited()

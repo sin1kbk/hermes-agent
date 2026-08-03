@@ -58,6 +58,7 @@ class TestDecisionOutboxViewConstruction:
     def test_renders_one_button_per_option(self):
         view = DecisionOutboxView(
             decision_id="d1", options=OPTIONS, recommended_id=None, timeout_seconds=None,
+            allowed_user_ids={"42"},
         )
         assert len(view.children) == 2
         ids = [b.custom_id for b in view.children]
@@ -95,6 +96,7 @@ class TestDecisionOutboxViewAnswer:
 
         view = DecisionOutboxView(
             decision_id="d1", options=OPTIONS, recommended_id=None, timeout_seconds=None,
+            allowed_user_ids={"42"},
         )
         interaction = _make_interaction(user_id="42")
 
@@ -110,6 +112,7 @@ class TestDecisionOutboxViewAnswer:
         monkeypatch.setattr("gateway.claude_bridge.write_decision_answer", lambda *a, **k: None)
         view = DecisionOutboxView(
             decision_id="d1", options=OPTIONS, recommended_id=None, timeout_seconds=None,
+            allowed_user_ids={"42"},
         )
         view.resolved = True
         interaction = _make_interaction()
@@ -118,6 +121,37 @@ class TestDecisionOutboxViewAnswer:
 
         interaction.response.send_message.assert_called_once()
         interaction.response.edit_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_click_is_rejected(self, monkeypatch):
+        """A clicker outside the user/role/pairing allowlist must not be able
+        to answer an escalation decision (mirrors ExecApprovalView's gate)."""
+        from unittest.mock import patch
+
+        for name in (
+            "DISCORD_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        written = []
+        monkeypatch.setattr(
+            "gateway.claude_bridge.write_decision_answer",
+            lambda *a, **k: written.append(a),
+        )
+        view = DecisionOutboxView(
+            decision_id="d1", options=OPTIONS, recommended_id=None, timeout_seconds=None,
+            allowed_user_ids={"owner-id"},
+        )
+        interaction = _make_interaction(user_id="42")
+
+        mock_store = MagicMock()
+        mock_store.is_approved.return_value = False
+        with patch("gateway.pairing.PairingStore", return_value=mock_store):
+            await view._answer(interaction, "a", "Option A")
+
+        assert written == []
+        assert view.resolved is False
+        interaction.response.send_message.assert_called_once()
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
 
     @pytest.mark.asyncio
     async def test_write_failure_leaves_view_unresolved_for_retry(self, monkeypatch):
@@ -131,6 +165,7 @@ class TestDecisionOutboxViewAnswer:
 
         view = DecisionOutboxView(
             decision_id="d1", options=OPTIONS, recommended_id=None, timeout_seconds=None,
+            allowed_user_ids={"42"},
         )
         interaction = _make_interaction(user_id="42")
 
@@ -150,6 +185,7 @@ class TestDecisionOutboxViewAnswer:
         monkeypatch.setattr("gateway.claude_bridge.write_decision_answer", lambda *a, **k: None)
         view = DecisionOutboxView(
             decision_id="d1", options=OPTIONS, recommended_id=None, timeout_seconds=None,
+            allowed_user_ids={"42"},
         )
         interaction = _make_interaction(user_id="42")
 
@@ -167,6 +203,7 @@ class TestDecisionOutboxViewAnswer:
         )
         view = DecisionOutboxView(
             decision_id="d1", options=OPTIONS, recommended_id=None, timeout_seconds=None,
+            allowed_user_ids={"42"},
         )
         embed = MagicMock()
         embed.color = None
@@ -204,3 +241,5 @@ class TestPostClaudeBridgeDecision:
         view = kwargs["view"]
         assert isinstance(view, DecisionOutboxView)
         assert view._message.id == 999
+        assert view.allowed_user_ids == adapter._allowed_user_ids
+        assert view.allowed_role_ids == adapter._allowed_role_ids
