@@ -33,6 +33,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from gateway.config import ClaudeBridgeConfig
 from gateway.platforms.base import MessageEvent
+from hermes_cli.providers import CLAUDE_BRIDGE_MODEL_ID
 from hermes_constants import get_hermes_home
 from utils import atomic_replace
 
@@ -54,6 +55,11 @@ _SECRET_NAME_FRAGMENTS = (
     "_TOKEN",
     "_KEY",
 )
+
+
+def _normalize_bridge_model(model: object) -> str:
+    value = model.strip() if isinstance(model, str) else ""
+    return "" if value.lower() == CLAUDE_BRIDGE_MODEL_ID else value
 
 
 def _bridge_home() -> Path:
@@ -248,14 +254,14 @@ class _ClaudeProcess:
         working_dir: str,
         resume_session_id: Optional[str],
         extra_args: List[str],
-        model: str = "claude-code",
+        model: str = "",
         on_unsolicited_result: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self._claude_bin = claude_bin
         self._working_dir = working_dir
         self._resume_session_id = resume_session_id
         self._extra_args = list(extra_args)
-        self.model = model
+        self.model = _normalize_bridge_model(model)
         self._on_unsolicited_result = on_unsolicited_result
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
@@ -296,7 +302,7 @@ class _ClaudeProcess:
         if self._resume_session_id:
             args += ["--resume", self._resume_session_id]
         args += self._extra_args
-        if self.model != "claude-code":
+        if self.model:
             args += ["--model", self.model]
 
         try:
@@ -738,9 +744,12 @@ class ClaudeBridge:
     async def _get_or_spawn_process(
         self, key: str, resume_session_id: Optional[str], model: str
     ) -> tuple[Optional[_ClaudeProcess], Optional[_SpawnOutcome]]:
+        model = _normalize_bridge_model(model)
         existing = self._procs.get(key)
-        if existing is not None and existing.is_alive and existing.model == model:
-            return existing, None
+        if existing is not None and existing.is_alive:
+            existing.model = _normalize_bridge_model(existing.model)
+            if existing.model == model:
+                return existing, None
         if existing is not None and existing.is_alive:
             logger.info(
                 "claude_bridge: model changed for %s (%s -> %s); respawning",
@@ -826,10 +835,10 @@ class ClaudeBridge:
         await self._discard_all_processes(intentional_stop=True)
 
     async def handle_message(
-        self, event: MessageEvent, *, model: str = "claude-code"
+        self, event: MessageEvent, *, model: str = ""
     ) -> Optional[str]:
         """Gateway ``MessageHandler`` for sessions routed to this provider."""
-        model = model.strip() if isinstance(model, str) and model.strip() else "claude-code"
+        model = _normalize_bridge_model(model)
         text = (event.text or "").strip()
 
         if text == "!halt":

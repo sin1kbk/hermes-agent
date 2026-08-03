@@ -213,6 +213,21 @@ async def test_disabled_bridge_routes_every_message_native(tmp_path, monkeypatch
     runner._claude_bridge_handler.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_legacy_bridge_session_override_is_normalized_before_dispatch(tmp_path, monkeypatch):
+    _write_config(tmp_path, monkeypatch, CLAUDE_BRIDGE_PROVIDER_ID)
+    runner = _runner()
+    session_key = runner._session_key_for_source(_event().source)
+    runner._session_model_overrides[session_key] = {
+        "model": CLAUDE_BRIDGE_MODEL_ID,
+        "provider": CLAUDE_BRIDGE_PROVIDER_ID,
+    }
+
+    event = _event()
+    assert await runner._select_message_handler()(event) == "bridge"
+    runner._claude_bridge_handler.assert_awaited_once_with(event, model="")
+
+
 class _NoopAsyncSessionStore:
     _store = None
 
@@ -297,6 +312,10 @@ async def test_model_command_switches_bridge_to_native_and_back(
     runner.session_store = _PersistedBridgeOverrideStore()
     router = runner._select_message_handler()
 
+    legacy_event = _event("legacy persisted override")
+    assert await router(legacy_event) == "bridge"
+    runner._claude_bridge_handler.assert_awaited_once_with(legacy_event, model="")
+
     native_switch = await router(
         _event(
             "/model qwen3.6:35b-a3b-coding-nvfp4 "
@@ -365,20 +384,7 @@ def test_bridge_provider_listing_is_gated_by_enabled_flag(monkeypatch):
         include_claude_bridge=False,
     )
 
-    bridge_rows = [
-        row for row in enabled_rows if row["slug"] == CLAUDE_BRIDGE_PROVIDER_ID
-    ]
-    assert bridge_rows == [
-        {
-            "slug": CLAUDE_BRIDGE_PROVIDER_ID,
-            "name": "Claude Bridge",
-            "is_current": False,
-            "is_user_defined": False,
-            "models": [CLAUDE_BRIDGE_MODEL_ID],
-            "total_models": 1,
-            "source": "virtual",
-        }
-    ]
+    assert all(row["slug"] != CLAUDE_BRIDGE_PROVIDER_ID for row in enabled_rows)
     assert all(
         row["slug"] != CLAUDE_BRIDGE_PROVIDER_ID for row in disabled_rows
     )
@@ -400,8 +406,8 @@ def test_bridge_provider_listing_uses_configured_models(monkeypatch):
 
     bridge_row = next(row for row in rows if row["slug"] == CLAUDE_BRIDGE_PROVIDER_ID)
     assert bridge_row["is_current"] is True
-    assert bridge_row["models"] == [CLAUDE_BRIDGE_MODEL_ID, "claude-opus-5"]
-    assert bridge_row["total_models"] == 2
+    assert bridge_row["models"] == ["claude-opus-5"]
+    assert bridge_row["total_models"] == 1
 
 
 def test_bridge_provider_switch_requires_enabled_flag(monkeypatch):
@@ -422,13 +428,14 @@ def test_bridge_provider_switch_requires_enabled_flag(monkeypatch):
         current_model="qwen",
         explicit_provider=CLAUDE_BRIDGE_PROVIDER_ID,
         allow_claude_bridge=True,
+        claude_bridge_models=["claude-opus-5"],
     )
 
     assert denied.success is False
     assert "enabled is false" in denied.error_message
     assert allowed.success is True
     assert allowed.target_provider == CLAUDE_BRIDGE_PROVIDER_ID
-    assert allowed.new_model == CLAUDE_BRIDGE_MODEL_ID
+    assert allowed.new_model == "claude-opus-5"
     assert allowed.base_url == ""
     assert allowed.api_key == ""
 
@@ -457,6 +464,66 @@ def test_bridge_provider_switch_rejects_models_not_in_config(monkeypatch):
     assert allowed.new_model == "claude-opus-5"
     assert denied.success is False
     assert "not configured" in denied.error_message
+
+
+def test_bridge_provider_switch_uses_config_default_only_when_listed(monkeypatch):
+    from hermes_cli.model_switch import switch_model
+
+    monkeypatch.setattr("agent.models_dev.get_provider_info", lambda _provider: None)
+    default_model = switch_model(
+        raw_input="",
+        current_provider="ollama-launch",
+        current_model="qwen",
+        explicit_provider=CLAUDE_BRIDGE_PROVIDER_ID,
+        allow_claude_bridge=True,
+        claude_bridge_models=["claude-opus-5", "claude-sonnet-4"],
+        claude_bridge_default_model="claude-sonnet-4",
+    )
+    fallback_model = switch_model(
+        raw_input="",
+        current_provider="ollama-launch",
+        current_model="qwen",
+        explicit_provider=CLAUDE_BRIDGE_PROVIDER_ID,
+        allow_claude_bridge=True,
+        claude_bridge_models=["claude-opus-5", "claude-sonnet-4"],
+        claude_bridge_default_model="not-in-list",
+    )
+
+    assert default_model.new_model == "claude-sonnet-4"
+    assert fallback_model.new_model == "claude-opus-5"
+
+
+def test_bridge_provider_switch_requires_configured_models(monkeypatch):
+    from hermes_cli.model_switch import switch_model
+
+    monkeypatch.setattr("agent.models_dev.get_provider_info", lambda _provider: None)
+    result = switch_model(
+        raw_input="",
+        current_provider="ollama-launch",
+        current_model="qwen",
+        explicit_provider=CLAUDE_BRIDGE_PROVIDER_ID,
+        allow_claude_bridge=True,
+    )
+
+    assert result.success is False
+    assert "Set claude_bridge.models" in result.error_message
+
+
+def test_bridge_provider_switch_rejects_legacy_model(monkeypatch):
+    from hermes_cli.model_switch import switch_model
+
+    monkeypatch.setattr("agent.models_dev.get_provider_info", lambda _provider: None)
+    result = switch_model(
+        raw_input=CLAUDE_BRIDGE_MODEL_ID,
+        current_provider="ollama-launch",
+        current_model="qwen",
+        explicit_provider=CLAUDE_BRIDGE_PROVIDER_ID,
+        allow_claude_bridge=True,
+        claude_bridge_models=["claude-opus-5"],
+    )
+
+    assert result.success is False
+    assert "not configured" in result.error_message
 
 
 def test_bridge_endpoint_resolution_fails_closed(tmp_path, monkeypatch):
