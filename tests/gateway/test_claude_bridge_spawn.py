@@ -368,6 +368,138 @@ async def test_resume_not_found_result_retries_once_as_fresh_process(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_resume_failure_logs_the_session_and_the_cli_error_text(
+    monkeypatch, hermes_home, caplog
+):
+    """The warning must name the cause; the process is gone by the time anyone looks."""
+    not_found = _FakeProc(responses=[[(json.dumps({
+        "type": "result", "is_error": True, "result": "missing", "session_id": "stale-session",
+        "subtype": "error_during_execution", "num_turns": 0,
+        "errors": ["No conversation found with session ID: stale-session"],
+    }) + "\n").encode()]], stderr_lines=[b"claude: could not read transcript\n"])
+    fresh = _FakeProc(responses=[[_result("fresh reply", "new-session")]])
+    monkeypatch.setattr(
+        "gateway.claude_bridge.asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=[not_found, fresh]),
+    )
+    bridge = _bridge(hermes_home)
+    bridge._sessions.set("discord:c1", "stale-session")
+
+    with caplog.at_level(logging.WARNING, logger="gateway.claude_bridge"):
+        await bridge.handle_message(_event("hello"))
+
+    warning = next(r.getMessage() for r in caplog.records if "resume failed" in r.getMessage())
+    assert "stale-session" in warning
+    assert "transcript not found" in warning
+    assert "No conversation found with session ID" in warning
+    assert "could not read transcript" in warning
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_failure_is_logged_apart_from_a_missing_transcript(
+    monkeypatch, hermes_home, caplog
+):
+    """An error_during_execution with no `errors` list is a different failure."""
+    stuck = _FakeProc(responses=[[(json.dumps({
+        "type": "result", "is_error": True, "result": "could not restart",
+        "session_id": "saved-session", "subtype": "error_during_execution", "num_turns": 0,
+    }) + "\n").encode()]])
+    fresh = _FakeProc(responses=[[_result("fresh reply", "new-session")]])
+    monkeypatch.setattr(
+        "gateway.claude_bridge.asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=[stuck, fresh]),
+    )
+    bridge = _bridge(hermes_home)
+    bridge._sessions.set("discord:c1", "saved-session")
+
+    with caplog.at_level(logging.WARNING, logger="gateway.claude_bridge"):
+        await bridge.handle_message(_event("hello"))
+
+    warning = next(r.getMessage() for r in caplog.records if "resume failed" in r.getMessage())
+    assert "error_during_execution with num_turns=0" in warning
+    assert "could not restart" in warning
+    assert "transcript not found" not in warning
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_background_output_keeps_an_idle_session_from_being_reaped(
+    monkeypatch, hermes_home
+):
+    """A session working on its own between turns is not idle.
+
+    Reaping it mid-tool-call leaves a transcript ending on an unanswered
+    tool_use, which the next turn can no longer resume.
+    """
+    proc = _FakeProc(responses=[[_result("ok", "saved-session")]])
+    monkeypatch.setattr(
+        "gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)
+    )
+    bridge = _bridge(hermes_home, idle_timeout_seconds=1)
+    await bridge.handle_message(_event("hello"))
+    resident = bridge._procs["discord:c1"]
+    resident.last_used = time.monotonic() - 2
+
+    # A background turn's own stream event, not a reply to anything we sent.
+    proc.stdout.feed_lines([
+        json.dumps({"type": "assistant", "message": {"content": []}}) + "\n"
+    ])
+    await asyncio.sleep(0)
+    await bridge._reap_idle_processes()
+
+    assert proc.killed is False
+    assert bridge._procs.get("discord:c1") is resident
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_failure_warning_stays_on_one_log_line(monkeypatch, hermes_home, caplog):
+    """Child output is untrusted text; a newline in it must not forge a log record."""
+    not_found = _FakeProc(responses=[[(json.dumps({
+        "type": "result", "is_error": True, "result": "missing", "session_id": "stale-session",
+        "subtype": "error_during_execution", "num_turns": 0,
+        "errors": ["No conversation found\n2026-01-01 00:00:00 INFO forged: all clear"],
+    }) + "\n").encode()]], stderr_lines=[b"first stderr line\nsecond stderr line\n"])
+    fresh = _FakeProc(responses=[[_result("fresh reply", "new-session")]])
+    monkeypatch.setattr(
+        "gateway.claude_bridge.asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=[not_found, fresh]),
+    )
+    bridge = _bridge(hermes_home)
+    bridge._sessions.set("discord:c1", "stale-session")
+
+    with caplog.at_level(logging.WARNING, logger="gateway.claude_bridge"):
+        await bridge.handle_message(_event("hello"))
+
+    warning = next(r.getMessage() for r in caplog.records if "resume failed" in r.getMessage())
+    assert "\n" not in warning
+    assert "\\n" in warning
+    assert "forged: all clear" in warning  # escaped, not dropped
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_child_output_does_not_defer_the_idle_reaper(monkeypatch, hermes_home):
+    """Only well-formed events count as work; garbage must not buy immortality."""
+    proc = _FakeProc(responses=[[_result("ok", "saved-session")]])
+    monkeypatch.setattr(
+        "gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)
+    )
+    bridge = _bridge(hermes_home, idle_timeout_seconds=1)
+    await bridge.handle_message(_event("hello"))
+    bridge._procs["discord:c1"].last_used = time.monotonic() - 2
+
+    proc.stdout.feed_lines([b"not json at all\n", b'"a bare string, not an object"\n'])
+    await asyncio.sleep(0)
+    await bridge._reap_idle_processes()
+
+    assert proc.killed is True
+    assert "discord:c1" not in bridge._procs
+    await bridge.close()
+
+
+@pytest.mark.asyncio
 async def test_existing_process_error_does_not_trigger_resume_fallback(monkeypatch, hermes_home):
     proc = _FakeProc(responses=[
         [_result("first", "saved-session")],
