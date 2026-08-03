@@ -13737,8 +13737,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         return self._route_message
 
-    def _resolve_effective_message_provider(self, source: SessionSource) -> str:
-        """Resolve provider as session override, channel override, then config."""
+    def _resolve_effective_message_provider(
+        self, source: SessionSource
+    ) -> tuple[str, str]:
+        """Resolve provider and model as session override, channel override, then config."""
+        from hermes_cli.model_switch import resolve_effective_model
+
         normalized_source = self._normalize_source_for_session_key(source)
         session_key = self._session_key_for_source(normalized_source)
         self._rehydrate_session_model_override(session_key)
@@ -13747,12 +13751,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_override = (
             state.conversation.model_override if state is not None else None
         )
+        channel_override = None
+        session_provider = ""
         if isinstance(session_override, dict):
-            provider = str(session_override.get("provider") or "").strip().lower()
-            if provider:
-                return provider
+            session_provider = str(
+                session_override.get("provider") or ""
+            ).strip().lower()
 
         config = getattr(self, "config", None)
+        channel_provider = ""
         if isinstance(getattr(config, "platforms", None), dict):
             channel_override = _get_channel_override(
                 config,
@@ -13769,11 +13776,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else None
                 ),
             )
-            provider = str(
+            channel_provider = str(
                 getattr(channel_override, "provider", "") or ""
             ).strip().lower()
-            if provider:
-                return provider
 
         try:
             runtime_config = _load_gateway_runtime_config()
@@ -13786,11 +13791,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 normalized_source.chat_id,
                 exc_info=True,
             )
-            return ""
+            return (
+                session_provider or channel_provider,
+                resolve_effective_model(session_override, channel_override, None),
+            )
         model_config = runtime_config.get("model", {})
         if not isinstance(model_config, dict):
-            return ""
-        return str(model_config.get("provider") or "").strip().lower()
+            return (
+                session_provider or channel_provider,
+                resolve_effective_model(session_override, channel_override, None),
+            )
+        return (
+            session_provider
+            or channel_provider
+            or str(model_config.get("provider") or "").strip().lower(),
+            resolve_effective_model(
+                session_override,
+                channel_override,
+                str(model_config.get("default") or model_config.get("model") or ""),
+            ),
+        )
 
     def _is_model_switch_command(self, event: MessageEvent) -> bool:
         """Return whether a command must be handled by the native model switcher."""
@@ -13825,14 +13845,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self.claude_bridge.enabled:
             return await self._handle_message(event)
 
-        provider = await asyncio.to_thread(
+        resolved_route = await asyncio.to_thread(
             self._resolve_effective_message_provider,
             event.source,
         )
+        if isinstance(resolved_route, tuple):
+            provider, model = resolved_route
+        else:
+            provider, model = resolved_route, "claude-code"
         if self._is_model_switch_command(event):
             return await self._handle_message(event)
         if provider == CLAUDE_BRIDGE_PROVIDER_ID:
-            return await self._claude_bridge_handler(event)
+            return await self._claude_bridge_handler(event, model=model or "claude-code")
         return await self._handle_message(event)
 
     def _bind_claude_bridge_notifier(self, adapter: Optional[Any] = None) -> None:
@@ -14008,7 +14032,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pairing_store._record_rate_limit(platform_name, source.user_id)
         return False
 
-    async def _claude_bridge_handler(self, event: MessageEvent) -> Optional[str]:
+    async def _claude_bridge_handler(
+        self, event: MessageEvent, *, model: str = "claude-code"
+    ) -> Optional[str]:
         """Authorization-gated entry point used when the bridge provider is active.
 
         ``ClaudeBridge.handle_message`` is deliberately platform/auth-agnostic
@@ -14053,7 +14079,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not await self._gate_unauthorized_message(event, is_internal=is_internal):
             return None
-        return await self.claude_bridge.handle_message(event)
+        if model == "claude-code":
+            return await self.claude_bridge.handle_message(event)
+        return await self.claude_bridge.handle_message(event, model=model)
 
     async def _resolve_async_delegation_session(
         self,
