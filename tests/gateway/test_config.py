@@ -215,17 +215,23 @@ class TestClaudeBridgeConfig:
         assert restored.working_dir is None
         assert restored.decision_channels == []
         assert restored.halt_users == []
-        assert restored.models == ["claude-code"]
+        assert restored.models == []
 
     def test_roundtrips_decision_channels(self):
         cfg = ClaudeBridgeConfig(
             enabled=True, working_dir="/repo", decision_channels=["123", "456"],
-            idle_timeout_seconds=321, models=["claude-code", "claude-opus-5"],
+            idle_timeout_seconds=321, models=["claude-opus-5"],
         )
         restored = ClaudeBridgeConfig.from_dict(cfg.to_dict())
         assert restored.decision_channels == ["123", "456"]
         assert restored.idle_timeout_seconds == 321
-        assert restored.models == ["claude-code", "claude-opus-5"]
+        assert restored.models == ["claude-opus-5"]
+
+    def test_legacy_claude_code_model_is_not_selectable(self):
+        restored = ClaudeBridgeConfig.from_dict(
+            {"models": ["claude-code", "claude-opus-5"]}
+        )
+        assert restored.models == ["claude-opus-5"]
 
     def test_non_list_decision_channels_falls_back_to_empty(self):
         restored = ClaudeBridgeConfig.from_dict({"decision_channels": "not-a-list"})

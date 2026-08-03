@@ -48,6 +48,16 @@ from agent.models_dev import (
     list_provider_models,
 )
 
+
+def _configured_claude_bridge_models(models: list[str] | None) -> list[str]:
+    """Return configured bridge models that are valid user-selectable choices."""
+    return [
+        candidate
+        for configured_model in models or []
+        if (candidate := str(configured_model or "").strip())
+        and candidate.lower() != CLAUDE_BRIDGE_MODEL_ID
+    ]
+
 # Providers whose picker model list should NOT be capped by max_models.
 # OpenCode Zen / Go are aggregators whose full catalogs (70+ models each) must
 # be visible so users can pick any model they have access to.
@@ -1218,6 +1228,7 @@ def switch_model(
     custom_providers: list | None = None,
     allow_claude_bridge: bool = False,
     claude_bridge_models: list[str] | None = None,
+    claude_bridge_default_model: str = "",
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1254,6 +1265,7 @@ def switch_model(
         custom_providers: The ``custom_providers:`` list from config.yaml.
         allow_claude_bridge: Whether the gateway-only virtual provider is available.
         claude_bridge_models: Models configured for the gateway-only provider.
+        claude_bridge_default_model: Global default model for the bridge.
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -1312,8 +1324,35 @@ def switch_model(
 
         target_provider = pdef.id
         if target_provider == CLAUDE_BRIDGE_PROVIDER_ID:
-            new_model = new_model or CLAUDE_BRIDGE_MODEL_ID
-        elif target_provider == "moa" and not new_model:
+            if not allow_claude_bridge:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=pdef.name,
+                    is_global=is_global,
+                    error_message=(
+                        "Provider 'claude-bridge' is unavailable because "
+                        "claude_bridge.enabled is false."
+                    ),
+                )
+            allowed_models = _configured_claude_bridge_models(claude_bridge_models)
+            if not allowed_models:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=pdef.name,
+                    is_global=is_global,
+                    error_message=(
+                        "Provider 'claude-bridge' has no configured models. "
+                        "Set claude_bridge.models in config.yaml."
+                    ),
+                )
+            if not new_model:
+                default_model = str(claude_bridge_default_model or "").strip()
+                new_model = (
+                    default_model if default_model in allowed_models else allowed_models[0]
+                )
+        if target_provider == "moa" and not new_model:
             try:
                 from hermes_cli.config import load_config
                 from hermes_cli.moa_config import normalize_moa_config
@@ -1599,11 +1638,23 @@ def switch_model(
                     "claude_bridge.enabled is false."
                 ),
             )
-        allowed_models = [CLAUDE_BRIDGE_MODEL_ID]
-        for configured_model in claude_bridge_models or []:
-            candidate = str(configured_model or "").strip()
-            if candidate and candidate not in allowed_models:
-                allowed_models.append(candidate)
+        allowed_models = _configured_claude_bridge_models(claude_bridge_models)
+        if not allowed_models:
+            return ModelSwitchResult(
+                success=False,
+                target_provider=target_provider,
+                provider_label=provider_label,
+                is_global=is_global,
+                error_message=(
+                    "Provider 'claude-bridge' has no configured models. "
+                    "Set claude_bridge.models in config.yaml."
+                ),
+            )
+        if not new_model:
+            default_model = str(claude_bridge_default_model or "").strip()
+            new_model = (
+                default_model if default_model in allowed_models else allowed_models[0]
+            )
         if new_model not in allowed_models:
             return ModelSwitchResult(
                 success=False,
@@ -3128,22 +3179,19 @@ def list_authenticated_providers(
             for row in results
         )
     ):
-        bridge_models = [CLAUDE_BRIDGE_MODEL_ID]
-        for configured_model in claude_bridge_models or []:
-            candidate = str(configured_model or "").strip()
-            if candidate and candidate not in bridge_models:
-                bridge_models.append(candidate)
-        results.append(
-            {
-                "slug": CLAUDE_BRIDGE_PROVIDER_ID,
-                "name": get_label(CLAUDE_BRIDGE_PROVIDER_ID),
-                "is_current": _current_provider_norm == CLAUDE_BRIDGE_PROVIDER_ID,
-                "is_user_defined": False,
-                "models": bridge_models,
-                "total_models": len(bridge_models),
-                "source": "virtual",
-            }
-        )
+        bridge_models = _configured_claude_bridge_models(claude_bridge_models)
+        if bridge_models:
+            results.append(
+                {
+                    "slug": CLAUDE_BRIDGE_PROVIDER_ID,
+                    "name": get_label(CLAUDE_BRIDGE_PROVIDER_ID),
+                    "is_current": _current_provider_norm == CLAUDE_BRIDGE_PROVIDER_ID,
+                    "is_user_defined": False,
+                    "models": bridge_models,
+                    "total_models": len(bridge_models),
+                    "source": "virtual",
+                }
+            )
 
     # Surface a custom / uncurated model the user selected via the CLI.
     # Each row's model list is its curated/live catalog, so a model the user set

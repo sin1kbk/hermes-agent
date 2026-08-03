@@ -1747,6 +1747,7 @@ class GatewaySlashCommandsMixin:
         )
         bridge_config = getattr(getattr(self, "claude_bridge", None), "config", None)
         claude_bridge_models = list(getattr(bridge_config, "models", []) or [])
+        claude_bridge_default_model = ""
         config_path = (_command_profile_home or _hermes_home) / "config.yaml"
         try:
             cfg = _load_gateway_config()
@@ -1754,6 +1755,9 @@ class GatewaySlashCommandsMixin:
                 model_cfg = cfg.get("model", {})
                 if isinstance(model_cfg, dict):
                     current_model = model_cfg.get("default", "")
+                    claude_bridge_default_model = str(
+                        model_cfg.get("default") or model_cfg.get("model") or ""
+                    ).strip()
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
                 user_provs = cfg.get("providers")
@@ -1859,6 +1863,7 @@ class GatewaySlashCommandsMixin:
                             custom_providers=custom_provs,
                             allow_claude_bridge=claude_bridge_enabled,
                             claude_bridge_models=claude_bridge_models,
+                            claude_bridge_default_model=claude_bridge_default_model,
                         )
                         if not result.success:
                             return t("gateway.model.error_prefix", error=result.error_message)
@@ -2196,6 +2201,7 @@ class GatewaySlashCommandsMixin:
             custom_providers=custom_provs,
             allow_claude_bridge=claude_bridge_enabled,
             claude_bridge_models=claude_bridge_models,
+            claude_bridge_default_model=claude_bridge_default_model,
         )
 
         if not result.success:

@@ -62,7 +62,7 @@ from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
-from hermes_cli.providers import CLAUDE_BRIDGE_PROVIDER_ID
+from hermes_cli.providers import CLAUDE_BRIDGE_MODEL_ID, CLAUDE_BRIDGE_PROVIDER_ID
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -13852,11 +13852,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if isinstance(resolved_route, tuple):
             provider, model = resolved_route
         else:
-            provider, model = resolved_route, "claude-code"
+            provider, model = resolved_route, ""
         if self._is_model_switch_command(event):
             return await self._handle_message(event)
         if provider == CLAUDE_BRIDGE_PROVIDER_ID:
-            return await self._claude_bridge_handler(event, model=model or "claude-code")
+            model = model.strip() if isinstance(model, str) else ""
+            if model.lower() == CLAUDE_BRIDGE_MODEL_ID:
+                model = ""
+            return await self._claude_bridge_handler(event, model=model)
         return await self._handle_message(event)
 
     def _bind_claude_bridge_notifier(self, adapter: Optional[Any] = None) -> None:
@@ -14033,7 +14036,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _claude_bridge_handler(
-        self, event: MessageEvent, *, model: str = "claude-code"
+        self, event: MessageEvent, *, model: str = ""
     ) -> Optional[str]:
         """Authorization-gated entry point used when the bridge provider is active.
 
@@ -14079,7 +14082,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not await self._gate_unauthorized_message(event, is_internal=is_internal):
             return None
-        if model == "claude-code":
+        model = model.strip() if isinstance(model, str) else ""
+        if model.lower() == CLAUDE_BRIDGE_MODEL_ID:
+            model = ""
+        if not model:
             return await self.claude_bridge.handle_message(event)
         return await self.claude_bridge.handle_message(event, model=model)
 
