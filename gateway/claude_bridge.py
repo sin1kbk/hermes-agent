@@ -50,6 +50,10 @@ DECISION_REQUIRED_KEYS = ("decision_id", "channel_id", "question", "options")
 # mode, so the shared name means "stop asking me" on both.
 YOLO_PERMISSION_MODE = "bypassPermissions"
 
+# How much of a failed --resume result's error text reaches the log. Long
+# enough to name the cause, short enough that one line stays one line.
+_RESUME_ERROR_EXCERPT_CHARS = 400
+
 # Env var name fragments that mark a value as secret-like. Broader than
 # hermes_subprocess_env's own lists on purpose: over-stripping costs the
 # bridged session nothing (its claude authenticates from its own stored
@@ -64,6 +68,16 @@ _SECRET_NAME_FRAGMENTS = (
     "_TOKEN",
     "_KEY",
 )
+
+
+def _flatten_for_log(text: str) -> str:
+    """Render untrusted child output as exactly one log line.
+
+    The resume-failure excerpt and the stderr tail are the CLI's own output,
+    which echoes whatever conversation it was processing.  An embedded newline
+    there would forge log records that read as separate, legitimate entries.
+    """
+    return "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in text)
 
 
 def _normalize_bridge_model(model: object) -> str:
@@ -493,6 +507,17 @@ class _ClaudeProcess:
         if not isinstance(event, dict):
             logger.warning("claude_bridge: ignoring non-object stream-json event")
             return
+        # A well-formed event proves the child is still working, including on a
+        # turn it started on its own between ours.  Refreshing only at turn
+        # start/end let the idle clock run while a background turn was in
+        # flight, so the reaper killed the session mid-tool-call and left a
+        # transcript ending on a tool_use nothing ever answered.
+        #
+        # Deliberately not paired with a hard max-lifetime cap: any such cap
+        # eventually kills a child that is legitimately working, which is the
+        # exact failure this refresh exists to prevent.  Malformed output is
+        # excluded above so a child looping on garbage still ages out.
+        self.last_used = time.monotonic()
         if event.get("type") != "result":
             return
         self._completed_result_count += 1
@@ -826,19 +851,30 @@ class ClaudeBridge:
         return proc, None
 
     @staticmethod
-    def _is_resume_failure(parsed: Dict[str, Any]) -> bool:
+    def _resume_failure_reason(parsed: Dict[str, Any]) -> Optional[str]:
+        """Why a ``--resume`` turn failed, or None when it did not fail that way.
+
+        The two branches have different causes — a transcript the CLI could not
+        locate, versus a session it located but could not restart — and only
+        this text tells them apart afterwards.  Callers log it verbatim; a bare
+        "resume failed" leaves the cause unrecoverable once the process is gone.
+        """
         errors = parsed.get("errors")
         error_text = (
             "\n".join(str(item) for item in errors)
             if isinstance(errors, list)
             else str(errors or "")
-        )
+        ).strip()
         if "No conversation found" in error_text:
-            return True
-        return (
+            return f"transcript not found: {error_text[:_RESUME_ERROR_EXCERPT_CHARS]}"
+        if (
             parsed.get("subtype") == "error_during_execution"
             and parsed.get("num_turns") == 0
-        )
+        ):
+            detail = error_text or str(parsed.get("result") or "").strip()
+            suffix = f": {detail[:_RESUME_ERROR_EXCERPT_CHARS]}" if detail else ""
+            return f"error_during_execution with num_turns=0{suffix}"
+        return None
 
     def _save_result_session(self, key: str, outcome: _SpawnOutcome) -> None:
         parsed = outcome.parsed
@@ -1093,15 +1129,24 @@ class ClaudeBridge:
             # A stale --resume ID is reported as an error *result*, not a
             # non-zero process exit.  Retry exactly once as a fresh process;
             # timeouts and intentional /stop interruptions never retry.
-            if (
-                attempted_resume
-                and outcome.parsed.get("is_error")
-                and self._is_resume_failure(outcome.parsed)
-                and not outcome.timed_out
-                and not outcome.interrupted
-            ):
+            resume_failure = (
+                self._resume_failure_reason(outcome.parsed)
+                if (
+                    attempted_resume
+                    and outcome.parsed.get("is_error")
+                    and not outcome.timed_out
+                    and not outcome.interrupted
+                )
+                else None
+            )
+            if resume_failure is not None:
                 logger.warning(
-                    "claude_bridge: resume failed for %s; retrying as a new session", key
+                    "claude_bridge: resume failed for %s (session=%s): %s | stderr: %s"
+                    " — retrying as a new session",
+                    key,
+                    resume_id,
+                    _flatten_for_log(resume_failure),
+                    _flatten_for_log(proc._stderr_summary()) if proc is not None else "",
                 )
                 if proc is not None:
                     await self._discard_process(key, proc)
