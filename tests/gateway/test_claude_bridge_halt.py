@@ -122,7 +122,7 @@ def test_halted_state_blocks_spawn_without_calling_it(hermes_home, monkeypatch):
         raise AssertionError("must not spawn while halted")
 
     monkeypatch.setattr(
-        "gateway.claude_bridge.asyncio.create_subprocess_exec",
+        "gateway.claude_bridge.core.asyncio.create_subprocess_exec",
         AsyncMock(side_effect=_fail_spawn),
     )
 
@@ -137,7 +137,7 @@ def test_unhalt_allows_spawn_again(hermes_home, monkeypatch):
     asyncio.run(bridge.handle_message(_event("!unhalt")))
 
     monkeypatch.setattr(
-        "gateway.claude_bridge.asyncio.create_subprocess_exec",
+        "gateway.claude_bridge.core.asyncio.create_subprocess_exec",
         AsyncMock(return_value=_successful_process()),
     )
 
