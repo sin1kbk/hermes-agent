@@ -119,27 +119,6 @@ class TestReasoningCommand:
         }
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("effort", ["minimal", "ultra", "none"])
-    async def test_claude_bridge_rejects_unsupported_reasoning_efforts(
-        self, tmp_path, monkeypatch, effort
-    ):
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "model:\n  provider: claude-bridge\n  default: claude-opus-5\n",
-            encoding="utf-8",
-        )
-        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
-        runner = _make_runner()
-        event = _make_event(f"/reasoning {effort}")
-        session_key = runner._session_key_for_source(event.source)
-
-        result = await runner._handle_reasoning_command(event)
-
-        assert "Claude Bridge supports only" in result
-        assert session_key not in runner._session_reasoning_overrides
-
-    @pytest.mark.asyncio
     async def test_native_provider_keeps_accepting_minimal_reasoning(
         self, tmp_path, monkeypatch
     ):

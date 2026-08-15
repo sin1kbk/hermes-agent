@@ -43,7 +43,7 @@ def _never_spawn(monkeypatch):
         raise AssertionError("must not spawn claude for a session-scoped command")
 
     monkeypatch.setattr(
-        "gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(side_effect=_fail),
+        "gateway.claude_bridge.core.asyncio.create_subprocess_exec", AsyncMock(side_effect=_fail),
     )
 
 
@@ -112,7 +112,7 @@ def test_non_command_slash_text_is_not_intercepted(hermes_home, monkeypatch):
     """Only recognized command names are intercepted — ordinary text starting
     with '/' (e.g. a shell path in a prompt) still reaches claude."""
     monkeypatch.setattr(
-        "gateway.claude_bridge.asyncio.create_subprocess_exec",
+        "gateway.claude_bridge.core.asyncio.create_subprocess_exec",
         AsyncMock(return_value=_successful_process()),
     )
     bridge = _bridge(hermes_home)

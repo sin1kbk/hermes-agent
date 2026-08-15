@@ -23,16 +23,12 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_cli.claude_bridge_defs import (
+    CLAUDE_BRIDGE_MODEL_ID, CLAUDE_BRIDGE_PROVIDER_ID, CLAUDE_BRIDGE_REASONING_EFFORTS,
+)
 from utils import base_url_host_matches, base_url_hostname
 
 logger = logging.getLogger(__name__)
-
-
-CLAUDE_BRIDGE_PROVIDER_ID = "claude-bridge"
-CLAUDE_BRIDGE_MODEL_ID = "claude-code"
-# Claude Code CLI accepts this strict subset of Hermes' broader reasoning
-# ladder. Keep the bridge boundary and its UI on the same canonical values.
-CLAUDE_BRIDGE_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 # -- Hermes overlay ----------------------------------------------------------

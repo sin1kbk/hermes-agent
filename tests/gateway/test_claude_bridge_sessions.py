@@ -80,7 +80,7 @@ def test_session_map_set_survives_persistence_failure(tmp_path):
     path = tmp_path / "sessions.json"
     store = _SessionMap(path)
 
-    with patch("gateway.claude_bridge._atomic_write_json", side_effect=OSError("disk full")):
+    with patch("gateway.claude_bridge.core._atomic_write_json", side_effect=OSError("disk full")):
         store.set("discord:c1", "sess-1")  # must not raise
 
     # In-memory state still reflects the write even though persistence failed.
@@ -92,7 +92,7 @@ def test_session_map_clear_survives_persistence_failure(tmp_path):
     store = _SessionMap(path)
     store.set("discord:c1", "sess-1")
 
-    with patch("gateway.claude_bridge._atomic_write_json", side_effect=OSError("disk full")):
+    with patch("gateway.claude_bridge.core._atomic_write_json", side_effect=OSError("disk full")):
         store.clear("discord:c1")  # must not raise
 
     assert store.get("discord:c1") is None

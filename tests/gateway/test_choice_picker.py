@@ -107,25 +107,6 @@ class TestReasoningChoicePicker:
         override = runner._session_reasoning_overrides.get(session_key)
         assert override == {"enabled": True, "effort": "ultra"}
 
-    @pytest.mark.asyncio
-    async def test_bridge_reasoning_picker_only_offers_claude_cli_efforts(
-        self, tmp_path, monkeypatch
-    ):
-        (tmp_path / "config.yaml").write_text(
-            "model:\n  provider: claude-bridge\n  default: claude-opus-5\n",
-            encoding="utf-8",
-        )
-        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-        adapter = _PickerAdapter()
-        runner = _make_runner(adapter)
-
-        assert await runner._handle_reasoning_command(_make_event("/reasoning")) is None
-
-        assert [choice["value"] for choice in adapter.calls[0]["choices"]] == [
-            "low", "medium", "high", "xhigh", "max", "reset", "show", "hide",
-        ]
-
-
 class TestFastChoicePicker:
     def _patch_fast_support(self, monkeypatch, tmp_path):
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)

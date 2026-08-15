@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from gateway.config import ClaudeBridgeConfig
+from gateway.claude_bridge.config import ClaudeBridgeConfig
 from gateway.platforms.base import MessageEvent
 from hermes_cli.providers import (
     CLAUDE_BRIDGE_MODEL_ID,
@@ -40,7 +40,9 @@ from hermes_cli.providers import (
 from hermes_constants import get_hermes_home
 from utils import atomic_replace
 
-logger = logging.getLogger(__name__)
+# Hardcoded: this module was the flat ``gateway/claude_bridge.py`` before the
+# package split, and external log filters key on the exact logger name.
+logger = logging.getLogger("gateway.claude_bridge")
 
 DECISION_REQUIRED_KEYS = ("decision_id", "channel_id", "question", "options")
 

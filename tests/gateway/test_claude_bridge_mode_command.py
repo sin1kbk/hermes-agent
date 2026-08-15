@@ -46,7 +46,7 @@ def _never_spawn(monkeypatch):
         raise AssertionError("must not spawn claude for a session-scoped command")
 
     monkeypatch.setattr(
-        "gateway.claude_bridge.asyncio.create_subprocess_exec", AsyncMock(side_effect=_fail),
+        "gateway.claude_bridge.core.asyncio.create_subprocess_exec", AsyncMock(side_effect=_fail),
     )
 
 
@@ -78,7 +78,7 @@ def _successful_process():
 
 def _spawn_mock(monkeypatch, count: int = 1) -> AsyncMock:
     spawn = AsyncMock(side_effect=[_successful_process() for _ in range(count)])
-    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr("gateway.claude_bridge.core.asyncio.create_subprocess_exec", spawn)
     return spawn
 
 
@@ -152,7 +152,7 @@ async def test_mode_matching_is_case_insensitive(hermes_home, monkeypatch):
 async def test_mode_switch_replaces_the_resident_process(hermes_home, monkeypatch):
     first, second = _successful_process(), _successful_process()
     spawn = AsyncMock(side_effect=[first, second])
-    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr("gateway.claude_bridge.core.asyncio.create_subprocess_exec", spawn)
     bridge = _bridge(hermes_home)
 
     await bridge.handle_message(_event("hello"))
@@ -173,7 +173,7 @@ async def test_requesting_the_mode_already_in_effect_keeps_the_process(hermes_ho
     """A no-op switch replaces nothing, so it must not kill a live process."""
     proc = _successful_process()
     spawn = AsyncMock(return_value=proc)
-    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr("gateway.claude_bridge.core.asyncio.create_subprocess_exec", spawn)
     bridge = _bridge(hermes_home)
 
     await bridge.handle_message(_event("hello"))
@@ -189,7 +189,7 @@ async def test_requesting_the_mode_already_in_effect_keeps_the_process(hermes_ho
 async def test_clearing_an_absent_override_keeps_the_process(hermes_home, monkeypatch):
     proc = _successful_process()
     spawn = AsyncMock(return_value=proc)
-    monkeypatch.setattr("gateway.claude_bridge.asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr("gateway.claude_bridge.core.asyncio.create_subprocess_exec", spawn)
     bridge = _bridge(hermes_home)
 
     await bridge.handle_message(_event("hello"))
