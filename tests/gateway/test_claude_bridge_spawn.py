@@ -724,9 +724,10 @@ async def test_result_marked_as_ours_still_answers_the_turn(monkeypatch, hermes_
 
 
 @pytest.mark.asyncio
-async def test_stray_result_with_no_waiter_is_dropped_not_carried_over(monkeypatch, hermes_home):
-    """Self-healing: even a result we cannot attribute is dropped rather than
-    left to shift the next reply."""
+async def test_stray_result_with_no_waiter_is_a_notice_not_carried_over(monkeypatch, hermes_home):
+    """Self-healing: a result we cannot attribute to a turn goes out as a
+    notice (it may be a steered message that raced the turn's end) but must
+    never be held to answer, and shift, the next reply."""
     proc = _FakeProc(responses=[[_result("reply to one")], [_result("reply to two")]])
     monkeypatch.setattr("gateway.claude_bridge.core.asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
     notices = []
@@ -737,7 +738,7 @@ async def test_stray_result_with_no_waiter_is_dropped_not_carried_over(monkeypat
     await _settle()
 
     assert await bridge.handle_message(_event("two")) == "reply to two"
-    assert notices == []
+    assert notices == [("discord:c1", "stray with no origin")]
     await bridge.close()
 
 

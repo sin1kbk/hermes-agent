@@ -271,6 +271,10 @@ class _ClaudeProcess:
     # reap happens on the drainer, outside any turn's timeout, so an unbounded
     # wait here would strand the turn until its own (much longer) deadline.
     _EOF_REAP_TIMEOUT = 5
+    # Drain deadline for a mid-turn steering write.  Short on purpose: a
+    # stdin pipe that stays full this long means the child stopped reading,
+    # and the caller falls back to queueing behind the turn instead.
+    _INJECT_DRAIN_TIMEOUT = 10
     # ``origin.kind`` values that still mean "this answers the prompt we put
     # on stdin".  Anything else — today only ``task-notification`` — is a turn
     # the CLI started by itself.  Unknown kinds are treated as unsolicited so
@@ -286,7 +290,7 @@ class _ClaudeProcess:
         extra_args: List[str],
         model: str = "",
         effort: str = "",
-        on_unsolicited_result: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_unsolicited_result: Optional[Callable[[Dict[str, Any], bool], None]] = None,
     ):
         self._claude_bin = claude_bin
         self._working_dir = working_dir
@@ -409,13 +413,8 @@ class _ClaudeProcess:
     def _stderr_summary(self) -> str:
         return self._stderr_tail.strip() or "(no stderr)"
 
-    async def send_turn(self, prompt: str, timeout_seconds: int) -> _SpawnOutcome:
-        """Write one user event and wait for the result event that answers it."""
-        if not self.is_alive or self.proc is None or self.proc.stdin is None:
-            return _SpawnOutcome(error="claude process is not running")
-        if self.intentional_stop:
-            return _SpawnOutcome(error="Claude turn was stopped", interrupted=True)
-
+    @staticmethod
+    def _user_event_payload(prompt: str) -> bytes:
         event = {
             "type": "user",
             "message": {
@@ -423,9 +422,18 @@ class _ClaudeProcess:
                 "content": [{"type": "text", "text": prompt}],
             },
         }
-        payload = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
-            "utf-8"
-        )
+        return (
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+
+    async def send_turn(self, prompt: str, timeout_seconds: int) -> _SpawnOutcome:
+        """Write one user event and wait for the result event that answers it."""
+        if not self.is_alive or self.proc is None or self.proc.stdin is None:
+            return _SpawnOutcome(error="claude process is not running")
+        if self.intentional_stop:
+            return _SpawnOutcome(error="Claude turn was stopped", interrupted=True)
+
+        payload = self._user_event_payload(prompt)
         waiter: asyncio.Future = asyncio.get_running_loop().create_future()
         self._turn_waiter = waiter
         self.is_turn_active = True
@@ -451,6 +459,47 @@ class _ClaudeProcess:
                 self._turn_waiter = None
             self.is_turn_active = False
             self.last_used = time.monotonic()
+
+    async def inject_prompt(self, prompt: str) -> Optional[str]:
+        """Write an extra user event into the turn in flight; no waiter.
+
+        The CLI folds a mid-turn user message into the active turn (same
+        steering as typing into an interactive session), so the one result
+        the turn's own waiter is holding for answers both prompts.  If the
+        turn happens to finish before this message is read, the CLI runs it
+        as a turn of its own and its result arrives with no waiter — which
+        ``_consume_line`` routes to the unsolicited notifier, so the text
+        still reaches the channel.
+
+        Returns an error string, or None on success.
+        """
+        if not self.is_alive or self.proc is None or self.proc.stdin is None:
+            return "claude process is not running"
+        if self.intentional_stop:
+            return "Claude turn was stopped"
+        try:
+            self.proc.stdin.write(self._user_event_payload(prompt))
+        except Exception as exc:
+            return f"claude stream failed: {exc}"
+        try:
+            await asyncio.wait_for(
+                self.proc.stdin.drain(), timeout=self._INJECT_DRAIN_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            # write() already handed the bytes to the transport irrevocably;
+            # a slow drain is backpressure, not a failed delivery.  Reporting
+            # failure here would make the caller queue the same text again
+            # and deliver it twice once the pipe empties.
+            logger.warning(
+                "claude_bridge: steering drain exceeded %ss; treating the "
+                "message as delivered", self._INJECT_DRAIN_TIMEOUT,
+            )
+        except Exception as exc:
+            # The transport is gone (e.g. broken pipe), so the bytes were
+            # not delivered — the caller may safely queue the message.
+            return f"claude stream failed: {exc}"
+        self.last_used = time.monotonic()
+        return None
 
     async def _drain_stdout(self) -> None:
         """Read stream-json events for the process's whole life, not per turn."""
@@ -527,13 +576,17 @@ class _ClaudeProcess:
             self._emit_unsolicited(event)
             return
         if not self._resolve_turn(_SpawnOutcome(parsed=event)):
-            # Nobody is waiting, so this cannot be an answer we owe anyone.
-            # Dropping it here is what keeps a single mis-attribution from
-            # shifting every later reply by one.
-            logger.warning(
-                "claude_bridge: discarding a result that arrived with no turn "
-                "waiting for it (session=%s)", event.get("session_id"),
+            # Nobody is waiting, so this cannot be an answer we owe a turn —
+            # handing it to a waiter would shift every later reply by one.
+            # It can still be text the channel deserves (a steering message
+            # that raced the turn's end and ran as its own turn, or a turn
+            # abandoned by cancellation), so it goes out as a notice.
+            logger.info(
+                "claude_bridge: routing a result that arrived with no turn "
+                "waiting for it to the notifier (session=%s)",
+                event.get("session_id"),
             )
+            self._emit_unsolicited(event, orphaned=True)
 
     @classmethod
     def _is_unsolicited(cls, event: Dict[str, Any]) -> bool:
@@ -544,11 +597,13 @@ class _ClaudeProcess:
         kind = origin.get("kind") if isinstance(origin, dict) else origin
         return str(kind) not in cls._SELF_ORIGIN_KINDS
 
-    def _emit_unsolicited(self, event: Dict[str, Any]) -> None:
+    def _emit_unsolicited(self, event: Dict[str, Any], *, orphaned: bool = False) -> None:
+        """``orphaned``: a result no turn was waiting for (vs. a turn the CLI
+        started on its own) — e.g. a steered message that raced its turn's end."""
         if self._on_unsolicited_result is None:
             return
         try:
-            self._on_unsolicited_result(event)
+            self._on_unsolicited_result(event, orphaned)
         except Exception:
             logger.exception("claude_bridge: unsolicited-result handler failed")
 
@@ -663,18 +718,31 @@ class ClaudeBridge:
         """
         self._notifier = notifier
 
-    def _handle_unsolicited_result(self, key: str, event: Dict[str, Any]) -> None:
-        """Route a self-started turn's result away from the message stream."""
+    def _handle_unsolicited_result(
+        self, key: str, event: Dict[str, Any], *, orphaned: bool = False
+    ) -> None:
+        """Route a result no turn is waiting for away from the message stream."""
         session_id = event.get("session_id")
         if session_id:
             self._sessions.set(key, str(session_id))
         origin = event.get("origin")
         logger.info(
-            "claude_bridge: unsolicited turn for key=%s origin=%s is_error=%s",
-            key, origin, event.get("is_error"),
+            "claude_bridge: unsolicited turn for key=%s origin=%s is_error=%s "
+            "orphaned=%s",
+            key, origin, event.get("is_error"), orphaned,
         )
         text = event.get("result")
-        if event.get("is_error") or not isinstance(text, str) or not text.strip():
+        if event.get("is_error"):
+            if not orphaned:
+                # A background turn's error is log noise, not a reply anyone
+                # is waiting on (pinned behavior).
+                return
+            # An orphaned turn is typically a steered message that raced its
+            # turn's end — its sender already got a "sent" ack, so a silent
+            # drop here would be the last they ever hear of it.
+            body = text.strip() if isinstance(text, str) else ""
+            text = f"Claude bridge error: {body or '(no result text)'}"
+        elif not isinstance(text, str) or not text.strip():
             return
         notifier = self._notifier
         if notifier is None:
@@ -836,7 +904,9 @@ class ClaudeBridge:
             model=model,
             effort=effort,
             on_unsolicited_result=(
-                lambda event, key=key: self._handle_unsolicited_result(key, event)
+                lambda event, orphaned, key=key: self._handle_unsolicited_result(
+                    key, event, orphaned=orphaned
+                )
             ),
         )
         spawn_error = await proc.start()
@@ -968,9 +1038,38 @@ class ClaudeBridge:
             return "Claude bridge is misconfigured: working_dir is not set."
 
         lock = await self._lock_for(key)
+        if lock.locked():
+            steer_reply = await self._try_steer_active_turn(key, text)
+            if steer_reply is not None:
+                return steer_reply
         async with self._semaphore:
             async with lock:
                 return await self._handle_locked(key, text, model, effort)
+
+    async def _try_steer_active_turn(self, key: str, text: str) -> Optional[str]:
+        """Feed a message into this channel's in-flight turn, if one exists.
+
+        This is what lets a mid-run Discord message reach the CLI immediately
+        instead of queueing behind the per-key lock until the turn ends.  Only
+        plain prompts land here — commands are intercepted earlier.  Returns
+        the reply to post, or None to fall through to the queue path (no turn
+        actually active, e.g. the lock holder is still spawning, or the
+        process stopped taking input).  A model/effort override on a steered
+        message is deliberately not applied — respawning would kill the very
+        turn being steered; it takes effect from the next queued turn.
+        """
+        proc = self._procs.get(key)
+        if proc is None or not proc.is_alive or not proc.is_turn_active:
+            return None
+        error = await proc.inject_prompt(text)
+        if error is not None:
+            logger.warning(
+                "claude_bridge: steering the active turn for %s failed (%s) "
+                "— queueing the message instead", key, error,
+            )
+            return None
+        logger.info("claude_bridge: steered the active turn for %s", key)
+        return "⏩ Sent to the Claude turn already running in this channel."
 
     async def _handle_mode_command(self, event: MessageEvent, key: str) -> str:
         """``/mode [name|default]`` — read or switch this channel's mode.
