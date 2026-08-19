@@ -51,3 +51,15 @@ class TestClaudeBridgeConfig:
 
     def test_resolved_working_dir_is_none_when_unset(self):
         assert ClaudeBridgeConfig.from_dict({}).resolved_working_dir is None
+
+    def test_busy_mode_defaults_to_steer(self):
+        assert ClaudeBridgeConfig.from_dict({}).busy_mode == "steer"
+
+    def test_busy_mode_queue_is_preserved(self):
+        restored = ClaudeBridgeConfig.from_dict({"busy_mode": "queue"})
+        assert restored.busy_mode == "queue"
+        assert restored.to_dict()["busy_mode"] == "queue"
+
+    def test_invalid_busy_mode_falls_back_to_queue(self):
+        restored = ClaudeBridgeConfig.from_dict({"busy_mode": "interrupt"})
+        assert restored.busy_mode == "queue"

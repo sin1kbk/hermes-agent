@@ -20,7 +20,12 @@ import asyncio
 import logging
 from typing import Any, Callable, Dict, Optional
 
-from gateway.claude_bridge.core import ClaudeBridge, OutboxWatcher, parse_channel_key
+from gateway.claude_bridge.core import (
+    ClaudeBridge,
+    OutboxWatcher,
+    channel_key,
+    parse_channel_key,
+)
 from gateway.claude_bridge.config import ClaudeBridgeConfig
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
@@ -233,6 +238,73 @@ class ClaudeBridgeRunnerMixin:
                 return await self._claude_bridge_handler(event, model=model)
             return await self._claude_bridge_handler(event, model=model, effort=effort)
         return await self._handle_message(event)
+
+    async def _claude_bridge_handle_busy_message(
+        self, event: MessageEvent, session_key: str, adapter: Any,
+    ) -> bool:
+        """Give a bridge session first refusal on its own busy-message.
+
+        Called from ``GatewayRunner._handle_active_session_busy_message``
+        (the native busy-session hook) before it falls into the
+        native-agent-centric queue/interrupt/steer machinery, which has no
+        notion of a bridge turn (bridge turns never populate ``turn.agent``,
+        so that machinery always degraded to its queue fallback — the
+        pre-steering behavior a Discord user saw even after ``ClaudeBridge``
+        itself grew a steering path, since messages never reached it while
+        the native guard considered the session busy).
+
+        Returns True when this method fully handled the message (steered and
+        acked it), so the caller must return immediately without running its
+        own queue/interrupt logic. Returns False for every case where the
+        bridge has no opinion — wrong provider, ``busy_mode: queue``, a
+        command, or no turn to steer into — so the caller's existing
+        behavior (queue behind the current turn) is completely unaffected.
+        """
+        if not self.claude_bridge.enabled:
+            return False
+        provider, _model = await asyncio.to_thread(
+            self._resolve_effective_message_provider, event.source
+        )
+        if provider != CLAUDE_BRIDGE_PROVIDER_ID:
+            return False
+        if self.claude_bridge.config.busy_mode != "steer":
+            return False
+        # A bridge-specific command (/mode, /yolo, /stop, ...) must reach
+        # ClaudeBridge.handle_message's own command interception, not be
+        # steered in as literal prompt text — same as a plain "no turn to
+        # steer into" miss, this falls through to the native queue fallback.
+        if event.get_command():
+            return False
+        text = (event.text or "").strip()
+        if not text:
+            return False
+
+        reply = await self.claude_bridge.try_steer(channel_key(event), text)
+        if reply is None:
+            return False
+
+        # The steer already landed on the CLI's stdin — that side effect is
+        # committed and cannot be undone. From here on this method MUST
+        # return True unconditionally: returning False after a successful
+        # steer would fall through to the native queue path and deliver the
+        # same text to the CLI a second time as a follow-up turn. A failure
+        # sending the ack is a lost notification, not grounds to re-deliver.
+        try:
+            reply_anchor = self._reply_anchor_for_event(event)
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=reply,
+                reply_to=reply_anchor,
+                metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+            )
+        except Exception:
+            logger.warning(
+                "claude_bridge: steered the active turn for %s but failed to "
+                "send the ack",
+                session_key,
+                exc_info=True,
+            )
+        return True
 
     def _bind_claude_bridge_notifier(self, adapter: Optional[Any] = None) -> None:
         """Give the bridge somewhere to post turns Claude ran unprompted.

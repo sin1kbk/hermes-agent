@@ -1071,6 +1071,15 @@ class ClaudeBridge:
         logger.info("claude_bridge: steered the active turn for %s", key)
         return "⏩ Sent to the Claude turn already running in this channel."
 
+    async def try_steer(self, key: str, text: str) -> Optional[str]:
+        """Public entry point for a caller outside ``handle_message``'s own
+        lock — the gateway's busy-session hook, which intercepts a follow-up
+        message before it would otherwise be queued behind the native
+        per-session guard. Same contract as the internal steering path:
+        returns the reply to send, or None when there is no turn to steer
+        into (the caller should fall back to its own queueing)."""
+        return await self._try_steer_active_turn(key, text)
+
     async def _handle_mode_command(self, event: MessageEvent, key: str) -> str:
         """``/mode [name|default]`` — read or switch this channel's mode.
 

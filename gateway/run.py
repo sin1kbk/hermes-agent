@@ -9679,6 +9679,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "internal", False):
             return False
 
+        # Bridge sessions get first refusal: a claude-bridge turn never
+        # populates ``turn.agent`` below, so without this the native
+        # queue/interrupt/steer machinery always treats it as un-steerable
+        # and falls back to queueing regardless of config. Real logic lives
+        # in ``gateway/claude_bridge/`` (fork-owned); this is the hook.
+        if await self._claude_bridge_handle_busy_message(event, session_key, adapter):
+            return True
+
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
 

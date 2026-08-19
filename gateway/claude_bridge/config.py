@@ -54,6 +54,16 @@ CLAUDE_PERMISSION_MODES = (
 )
 DEFAULT_CLAUDE_PERMISSION_MODE = "auto"
 
+# How a message arriving while a channel's turn is still running is handled.
+# "steer": written straight into the active turn (bypasses the gateway's
+# native busy-session queue/interrupt machinery entirely, since a resident
+# claude process has no equivalent of "kill and restart" without losing
+# --resume context). "queue": falls through to the gateway's existing
+# behavior for this session (merged as a follow-up turn after the current
+# one finishes) — the pre-steering default.
+CLAUDE_BRIDGE_BUSY_MODES = ("steer", "queue")
+DEFAULT_CLAUDE_BRIDGE_BUSY_MODE = "steer"
+
 
 @dataclass
 class ClaudeBridgeConfig:
@@ -95,6 +105,8 @@ class ClaudeBridgeConfig:
     # external/untrusted party, but a non-empty allowlist still bounds where
     # a buggy or compromised prompt could direct a decision post.
     decision_channels: List[str] = field(default_factory=list)
+    # See CLAUDE_BRIDGE_BUSY_MODES.
+    busy_mode: str = DEFAULT_CLAUDE_BRIDGE_BUSY_MODE
 
     @property
     def resolved_working_dir(self) -> Optional[str]:
@@ -123,6 +135,7 @@ class ClaudeBridgeConfig:
             "default_permission_mode": self.default_permission_mode,
             "allowed_permission_modes": list(self.allowed_permission_modes),
             "decision_channels": list(self.decision_channels),
+            "busy_mode": self.busy_mode,
         }
 
     @classmethod
@@ -147,6 +160,14 @@ class ClaudeBridgeConfig:
         decision_channels = data.get("decision_channels") or []
         if not isinstance(decision_channels, list):
             decision_channels = []
+        busy_mode = str(data.get("busy_mode") or DEFAULT_CLAUDE_BRIDGE_BUSY_MODE)
+        if busy_mode not in CLAUDE_BRIDGE_BUSY_MODES:
+            logger.warning(
+                "claude_bridge.busy_mode=%r is not one of %s; falling back to "
+                "'queue' (the pre-steering behavior)",
+                busy_mode, CLAUDE_BRIDGE_BUSY_MODES,
+            )
+            busy_mode = "queue"
         working_dir = data.get("working_dir")
         default_mode = str(
             data.get("default_permission_mode") or DEFAULT_CLAUDE_PERMISSION_MODE
@@ -204,6 +225,7 @@ class ClaudeBridgeConfig:
             default_permission_mode=default_mode,
             allowed_permission_modes=allowed_modes,
             decision_channels=[str(c) for c in decision_channels],
+            busy_mode=busy_mode,
         )
 
 
