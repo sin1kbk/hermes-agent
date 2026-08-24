@@ -131,3 +131,50 @@ async def test_ack_send_failure_still_returns_true_to_avoid_double_delivery():
 
     assert handled is True
     runner.claude_bridge.try_steer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_carries_the_attachment_note(tmp_path):
+    """The busy path never reaches ClaudeBridge.handle_message, so it has to
+    build the attachment note itself — otherwise a message sent mid-turn
+    silently loses its attachments."""
+    attachment = tmp_path / "shot.png"
+    attachment.write_bytes(b"fake")
+    event = _event("look at this")
+    event.media_urls = [str(attachment)]
+    event.media_types = ["image/png"]
+    runner = _runner()
+
+    handled = await runner._claude_bridge_handle_busy_message(event, "session-key", _adapter())
+
+    assert handled is True
+    steered = runner.claude_bridge.try_steer.await_args.args[1]
+    assert str(attachment) in steered
+    assert steered.endswith("look at this")
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_handles_an_attachment_only_message(tmp_path):
+    """An attachment with no caption used to fall through to the native queue
+    because the text was empty."""
+    attachment = tmp_path / "report.pdf"
+    attachment.write_bytes(b"fake")
+    event = _event("")
+    event.media_urls = [str(attachment)]
+    event.media_types = ["application/pdf"]
+    runner = _runner()
+
+    handled = await runner._claude_bridge_handle_busy_message(event, "session-key", _adapter())
+
+    assert handled is True
+    assert str(attachment) in runner.claude_bridge.try_steer.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_without_text_or_attachments_falls_through():
+    runner = _runner()
+
+    handled = await runner._claude_bridge_handle_busy_message(_event(""), "session-key", _adapter())
+
+    assert handled is False
+    runner.claude_bridge.try_steer.assert_not_awaited()

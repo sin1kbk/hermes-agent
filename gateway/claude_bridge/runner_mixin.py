@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, Optional
 from gateway.claude_bridge.core import (
     ClaudeBridge,
     OutboxWatcher,
+    build_media_context_note,
     channel_key,
     parse_channel_key,
 )
@@ -276,8 +277,16 @@ class ClaudeBridgeRunnerMixin:
         if event.get_command():
             return False
         text = (event.text or "").strip()
-        if not text:
+        # This path never reaches ClaudeBridge.handle_message, so it has to
+        # build the attachment note itself — otherwise a message sent while a
+        # turn is running loses its attachments, and an attachment-only
+        # message (empty text) is not steered at all.
+        media_note = build_media_context_note(
+            getattr(event, "media_urls", None), getattr(event, "media_types", None)
+        )
+        if not text and not media_note:
             return False
+        text = f"{media_note}{text}" if media_note else text
 
         reply = await self.claude_bridge.try_steer(channel_key(event), text)
         if reply is None:
@@ -336,7 +345,65 @@ class ClaudeBridgeRunnerMixin:
                     )
                     return
                 metadata = {"thread_id": thread_id} if thread_id else None
-                await send(chat_id, text, metadata=metadata)
+
+                # A background-task turn has no _process_message_background
+                # run of its own to extract its MEDIA: tags, so without this
+                # a MEDIA:<path> tag would show up as inert text with
+                # nothing attached. Extraction has to precede the send for
+                # the same reason base.py extracts first: the tag is stripped
+                # from the text that reaches the chat. Cheap substring check
+                # first so a plain-text notice never touches extraction.
+                media_files = []
+                if "MEDIA:" in text:
+                    media_files, text = adapter.extract_media(text)
+                    media_files = adapter.filter_media_delivery_paths(media_files)
+
+                if text.strip():
+                    await send(chat_id, text, metadata=metadata)
+                if not text.strip() and not media_files:
+                    logger.warning(
+                        "claude_bridge: unsolicited notice for %s had nothing "
+                        "left to deliver after media extraction", key,
+                    )
+                for media_path, is_voice in media_files:
+                    try:
+                        if is_voice:
+                            result = await adapter.send_voice(
+                                chat_id=chat_id, audio_path=media_path,
+                                metadata=metadata,
+                            )
+                        else:
+                            result = await adapter.send_document(
+                                chat_id=chat_id, file_path=media_path,
+                                metadata=metadata,
+                            )
+                        if not result.success:
+                            logger.warning(
+                                "claude_bridge: failed to deliver unsolicited "
+                                "attachment %s: %s", media_path, result.error,
+                            )
+                            # A server-side log is invisible to the person
+                            # waiting in chat; the normal turn path answers
+                            # the same failure with this notice (#66797).
+                            await adapter._notify_media_delivery_failure(
+                                chat_id, media_path, is_voice=is_voice,
+                                metadata=metadata,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "claude_bridge: error sending unsolicited attachment %s",
+                            media_path, exc_info=True,
+                        )
+                        try:
+                            await adapter._notify_media_delivery_failure(
+                                chat_id, media_path, is_voice=is_voice,
+                                metadata=metadata,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "claude_bridge: could not even notify the failed "
+                                "delivery of %s", media_path, exc_info=True,
+                            )
 
             self.claude_bridge.set_notifier(_post_unsolicited)
         except Exception:

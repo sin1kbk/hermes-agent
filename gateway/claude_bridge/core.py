@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -80,6 +81,51 @@ def _flatten_for_log(text: str) -> str:
     there would forge log records that read as separate, legitimate entries.
     """
     return "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in text)
+
+
+def build_media_context_note(
+    media_urls: Optional[List[str]], media_types: Optional[List[str]] = None
+) -> str:
+    """Prompt prefix telling the CLI what the event's attachments are and
+    where they live, so it reads them instead of asking the user to paste
+    their contents (same failure this bridge is prone to as the one
+    ``_build_document_context_note`` in ``gateway/run.py`` documents).
+
+    ``media_urls`` entries are almost always local absolute paths written by
+    the platform adapter's own attachment cache. A bare URL only appears when
+    that caching failed and the adapter fell back to the platform's CDN link
+    (see Discord's adapter). Paths are never rewritten: this bridge execs the
+    CLI directly on the host (``create_subprocess_exec(cwd=working_dir)``),
+    so a raw host-absolute path is already valid for the CLI's own tools —
+    unlike the Docker/Modal terminal backends, no cache-path translation
+    applies on this path.
+    """
+    # Both fields arrive straight from a platform adapter, so neither the
+    # element type nor the two lists' lengths are guaranteed here.
+    urls = [str(u).strip() for u in (media_urls or []) if str(u or "").strip()]
+    if not urls:
+        return ""
+    types = list(media_types or [])
+    lines = []
+    for i, url in enumerate(urls):
+        raw_type = types[i] if i < len(types) else None
+        mtype = f" ({raw_type})" if isinstance(raw_type, str) and raw_type.strip() else ""
+        if os.path.isabs(url):
+            # An absolute path stays a path even when the file is already
+            # gone (the cache is pruned on a timer): say so rather than
+            # mislabelling it a remote URL the CLI could try to fetch.
+            missing = "" if os.path.exists(url) else " [no longer on disk]"
+            lines.append(f"- {url}{mtype}{missing}")
+        else:
+            lines.append(f"- {url}{mtype} [remote URL, not a local file]")
+    return (
+        "[The user attached the following file(s) with this message:\n"
+        + "\n".join(lines)
+        + "\nThese are binary attachments; their content is not inlined here. "
+        "Read each one yourself with your own tools (e.g. Read, or the "
+        "terminal) before answering, instead of asking the user what they "
+        "contain.]\n\n"
+    )
 
 
 def _normalize_bridge_model(model: object) -> str:
@@ -1036,6 +1082,12 @@ class ClaudeBridge:
                 "claude_bridge.enabled=true but claude_bridge.working_dir is unset"
             )
             return "Claude bridge is misconfigured: working_dir is not set."
+
+        media_note = build_media_context_note(
+            getattr(event, "media_urls", None), getattr(event, "media_types", None)
+        )
+        if media_note:
+            text = f"{media_note}{text}"
 
         lock = await self._lock_for(key)
         if lock.locked():
