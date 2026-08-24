@@ -83,6 +83,13 @@ class ClaudeBridgeConfig:
     # session_id remains in sessions.json and the next message resumes it.
     # 0 or a negative value disables idle reaping.
     idle_timeout_seconds: int = 1800
+    # Ceiling on resident CLI children, evicted least-recently-used first.
+    # Idle reaping alone does not bound them: a child is ~650MB and every
+    # chat thread gets its own, so N threads touched inside one idle window
+    # hold N children at once.  Eviction only ends the process; the key's
+    # session_id stays in sessions.json and the next message resumes it.
+    # 0 or a negative value disables the cap.
+    max_resident_processes: int = 3
     # User IDs allowed to send !halt / !unhalt. Empty = anyone may.
     halt_users: List[str] = field(default_factory=list)
     # Extra argv appended to the `claude -p ...` invocation.
@@ -129,6 +136,7 @@ class ClaudeBridgeConfig:
             "max_concurrency": self.max_concurrency,
             "timeout_seconds": self.timeout_seconds,
             "idle_timeout_seconds": self.idle_timeout_seconds,
+            "max_resident_processes": self.max_resident_processes,
             "halt_users": list(self.halt_users),
             "extra_args": list(self.extra_args),
             "models": list(self.models),
@@ -214,6 +222,9 @@ class ClaudeBridgeConfig:
             max_concurrency=_coerce_int(data.get("max_concurrency"), 2),
             timeout_seconds=_coerce_int(data.get("timeout_seconds"), 900),
             idle_timeout_seconds=_coerce_int(data.get("idle_timeout_seconds"), 1800),
+            max_resident_processes=_coerce_int(
+                data.get("max_resident_processes"), 3
+            ),
             halt_users=[str(u) for u in halt_users],
             extra_args=[str(a) for a in extra_args],
             models=[

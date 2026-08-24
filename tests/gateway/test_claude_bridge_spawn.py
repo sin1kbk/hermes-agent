@@ -824,3 +824,97 @@ async def test_spawn_env_strips_gateway_secrets(monkeypatch, hermes_home):
     # Sanitized, not emptied: the process still needs a normal environment.
     assert env["PATH"] == "/usr/bin:/bin"
     await bridge.close()
+
+
+def _chat_event(chat_id: str, text: str = "hello") -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        source=SessionSource(platform=Platform.DISCORD, chat_id=chat_id, user_id="u1"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resident_cap_evicts_the_least_recently_used_process(monkeypatch, hermes_home):
+    """Idle reaping alone leaves one ~650MB child per chat inside its window."""
+    procs = [_FakeProc(responses=[[_result("ok", f"sess-{i}")]]) for i in range(3)]
+    monkeypatch.setattr(
+        "gateway.claude_bridge.core.asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=procs),
+    )
+    bridge = _bridge(hermes_home, max_resident_processes=2)
+
+    for index, chat in enumerate(("c1", "c2", "c3")):
+        await bridge.handle_message(_chat_event(chat))
+        # Distinct last_used values, so "least recently used" is unambiguous.
+        if f"discord:{chat}" in bridge._procs:
+            bridge._procs[f"discord:{chat}"].last_used = float(index)
+
+    assert set(bridge._procs) == {"discord:c2", "discord:c3"}
+    assert procs[0].killed is True
+    # Eviction ends the process, never the conversation.
+    assert bridge._sessions.get("discord:c1") == "sess-0"
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_resident_cap_never_evicts_a_turn_in_flight(monkeypatch, hermes_home):
+    procs = [_FakeProc(responses=[[_result("ok", f"sess-{i}")]]) for i in range(3)]
+    monkeypatch.setattr(
+        "gateway.claude_bridge.core.asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=procs),
+    )
+    bridge = _bridge(hermes_home, max_resident_processes=2)
+
+    await bridge.handle_message(_chat_event("c1"))
+    await bridge.handle_message(_chat_event("c2"))
+    bridge._procs["discord:c1"].last_used = 0.0
+    bridge._procs["discord:c2"].last_used = 1.0
+    bridge._procs["discord:c1"].is_turn_active = True
+
+    await bridge.handle_message(_chat_event("c3"))
+
+    assert set(bridge._procs) == {"discord:c1", "discord:c3"}
+    assert procs[0].killed is False
+    assert procs[1].killed is True
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_resident_cap_of_zero_disables_eviction(monkeypatch, hermes_home):
+    procs = [_FakeProc(responses=[[_result("ok", f"sess-{i}")]]) for i in range(3)]
+    monkeypatch.setattr(
+        "gateway.claude_bridge.core.asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=procs),
+    )
+    bridge = _bridge(hermes_home, max_resident_processes=0)
+
+    for chat in ("c1", "c2", "c3"):
+        await bridge.handle_message(_chat_event(chat))
+
+    assert set(bridge._procs) == {"discord:c1", "discord:c2", "discord:c3"}
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_resident_cap_never_evicts_a_session_working_in_the_background(
+    monkeypatch, hermes_home
+):
+    """Recent stream output means a tool call is in flight, not that it is idle."""
+    procs = [_FakeProc(responses=[[_result("ok", f"sess-{i}")]]) for i in range(3)]
+    monkeypatch.setattr(
+        "gateway.claude_bridge.core.asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=procs),
+    )
+    bridge = _bridge(hermes_home, max_resident_processes=2)
+
+    await bridge.handle_message(_chat_event("c1"))
+    await bridge.handle_message(_chat_event("c2"))
+    bridge._procs["discord:c1"].last_used = time.monotonic()  # just emitted output
+    bridge._procs["discord:c2"].last_used = 1.0
+
+    await bridge.handle_message(_chat_event("c3"))
+
+    assert set(bridge._procs) == {"discord:c1", "discord:c3"}
+    assert procs[0].killed is False
+    assert procs[1].killed is True
+    await bridge.close()

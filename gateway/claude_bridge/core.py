@@ -703,6 +703,11 @@ class _ClaudeProcess:
 class ClaudeBridge:
     """Owns persistent Claude processes, session continuity, and halt state."""
 
+    # Silence required before a resident child is eligible for cap eviction.
+    # `last_used` is bumped by the child's own background stream events, so
+    # this separates "working without us" from "sitting idle".
+    _EVICT_SILENCE_GRACE = 60
+
     def __init__(
         self,
         config: ClaudeBridgeConfig,
@@ -873,6 +878,38 @@ class ClaudeBridge:
             logger.info("claude_bridge: reaping idle process for %s", key)
             await self._discard_process(key, proc)
 
+    async def _evict_over_resident_cap(self, incoming_key: str) -> None:
+        """Make room for one more child by discarding the least recently used.
+
+        A child running a turn, or one that emitted a stream event within
+        ``_EVICT_SILENCE_GRACE``, is never evicted: killing a session
+        mid-tool-call leaves a transcript ending on an unanswered tool_use
+        that the next message can no longer resume.  A bridge where every
+        child is working therefore stays over the cap.
+        """
+        cap = self.config.max_resident_processes
+        if cap <= 0:
+            return
+        now = time.monotonic()
+        candidates = sorted(
+            (
+                (key, proc)
+                for key, proc in self._procs.items()
+                if key != incoming_key
+                and not proc.is_turn_active
+                and now - proc.last_used >= self._EVICT_SILENCE_GRACE
+            ),
+            key=lambda item: item[1].last_used,
+        )
+        while len(self._procs) >= cap and candidates:
+            key, proc = candidates.pop(0)
+            logger.info(
+                "claude_bridge: evicting least-recently-used process for %s "
+                "(resident cap %d)",
+                key, cap,
+            )
+            await self._discard_process(key, proc)
+
     async def _discard_process(
         self,
         key: str,
@@ -932,6 +969,8 @@ class ClaudeBridge:
                 )
         if existing is not None:
             await self._discard_process(key, existing)
+
+        await self._evict_over_resident_cap(key)
 
         proc = _ClaudeProcess(
             claude_bin=self.config.claude_bin,
