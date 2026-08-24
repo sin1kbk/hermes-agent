@@ -552,7 +552,16 @@ class ClaudeBridgeRunnerMixin:
             if event.get_command():
                 return
             source = event.source
-            if not self._is_discord_auto_thread_lane(source):
+            # NOT _is_discord_auto_thread_lane: its auto-thread markers are
+            # stamped only on the turn that CREATES the thread (the adapter
+            # skips that block once is_thread is true), so gating on it would
+            # rename exactly once and never again. Any Discord thread hosting
+            # a bridge turn is a rename target.
+            if (
+                getattr(source, "platform", None) != Platform.DISCORD
+                or getattr(source, "chat_type", None) != "thread"
+                or not getattr(source, "thread_id", None)
+            ):
                 return
             text = (event.text or "").strip()
             if not is_titleable_user_message(text):

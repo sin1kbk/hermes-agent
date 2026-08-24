@@ -34,11 +34,10 @@ def _event(text: str = "please refactor the outbox watcher") -> MessageEvent:
     )
 
 
-def _runner(*, auto_thread_lane: bool = True, adapter=None):
+def _runner(*, adapter=None):
     runner = object.__new__(GatewayRunner)
     runner._claude_bridge_retitle_counts = {}
     runner._claude_bridge_retitle_tasks = set()
-    runner._is_discord_auto_thread_lane = MagicMock(return_value=auto_thread_lane)
     runner._sanitize_discord_thread_title = MagicMock(side_effect=lambda t: t)
     runner._adapter_for_source = MagicMock(
         return_value=adapter if adapter is not None else _adapter()
@@ -110,11 +109,14 @@ async def test_command_turn_is_not_counted(titler):
 
 
 @pytest.mark.asyncio
-async def test_non_auto_thread_source_is_not_counted(titler):
+async def test_channel_source_without_a_thread_is_not_counted(titler):
     adapter = _adapter()
-    runner = _runner(auto_thread_lane=False, adapter=adapter)
+    runner = _runner(adapter=adapter)
+    event = _event()
+    event.source.chat_type = "channel"
+    event.source.thread_id = None
 
-    runner._schedule_claude_bridge_retitle(_event())
+    runner._schedule_claude_bridge_retitle(event)
     await _drain(runner)
 
     assert runner._claude_bridge_retitle_counts == {}
@@ -163,3 +165,22 @@ async def test_rename_failure_is_swallowed(titler):
     await _drain(runner)  # must not raise
 
     adapter.rename_thread.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre_existing_thread_still_renames(titler):
+    """The auto-thread markers only exist on the turn that CREATED the thread.
+
+    Gating on them renamed once and never again — every later turn arrives in
+    an existing thread and carries no markers at all.
+    """
+    adapter = _adapter()
+    runner = _runner(adapter=adapter)
+    event = _event()
+    event.source.auto_thread_created = False
+    event.source.auto_thread_initial_name = None
+
+    runner._schedule_claude_bridge_retitle(event)
+    await _drain(runner)
+
+    adapter.rename_thread.assert_awaited_once_with("t1", TITLE)
