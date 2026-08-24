@@ -76,6 +76,12 @@ class ClaudeBridgeRunnerMixin:
     # raw message excerpt the Discord adapter named the thread with; the later
     # fires let the name follow the work as it moves.
     _RETITLE_EVERY = 5
+    # Turns shorter than this never name the thread. The native titler reads a
+    # SINGLE turn, so a throwaway ("ping", "テスト") became the thread's name
+    # (measured: a thread renamed to 'Ping network connection'). Short turns
+    # are skipped entirely rather than counted, so the cadence lands on a turn
+    # that actually says something.
+    _RETITLE_MIN_CHARS = 15
 
     def _init_claude_bridge(self) -> None:
         self.claude_bridge = ClaudeBridge(self.config.claude_bridge)
@@ -564,6 +570,8 @@ class ClaudeBridgeRunnerMixin:
             ):
                 return
             text = (event.text or "").strip()
+            if len(text) < self._RETITLE_MIN_CHARS:
+                return
             if not is_titleable_user_message(text):
                 return
 

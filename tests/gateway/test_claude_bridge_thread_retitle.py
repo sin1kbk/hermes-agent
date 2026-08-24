@@ -184,3 +184,16 @@ async def test_pre_existing_thread_still_renames(titler):
     await _drain(runner)
 
     adapter.rename_thread.assert_awaited_once_with("t1", TITLE)
+
+
+@pytest.mark.asyncio
+async def test_short_turn_is_not_counted(titler):
+    """A throwaway turn must not name the thread — nor consume a cadence slot."""
+    adapter = _adapter()
+    runner = _runner(adapter=adapter)
+
+    runner._schedule_claude_bridge_retitle(_event("テスト"))
+    await _drain(runner)
+
+    assert runner._claude_bridge_retitle_counts == {}
+    adapter.rename_thread.assert_not_awaited()
