@@ -67,11 +67,22 @@ class ClaudeBridgeRunnerMixin:
     claude_bridge: "ClaudeBridge" = ClaudeBridge(ClaudeBridgeConfig())
     _claude_bridge_outbox_watcher: Optional["OutboxWatcher"] = None
     _claude_bridge_outbox_watcher_task: Optional[asyncio.Task] = None
+    # Per-channel bridge turn counts driving the periodic thread re-title.
+    # Lazily created per instance (never a shared mutable class default) and
+    # deliberately in-memory: a restart just re-titles on the next turn.
+    _claude_bridge_retitle_counts: Optional[Dict[str, int]] = None
+    _claude_bridge_retitle_tasks: Optional[set] = None
+    # Re-title on every Nth bridge turn (1, 6, 11, ...). Turn 1 upgrades the
+    # raw message excerpt the Discord adapter named the thread with; the later
+    # fires let the name follow the work as it moves.
+    _RETITLE_EVERY = 5
 
     def _init_claude_bridge(self) -> None:
         self.claude_bridge = ClaudeBridge(self.config.claude_bridge)
         self._claude_bridge_outbox_watcher: Optional[OutboxWatcher] = None
         self._claude_bridge_outbox_watcher_task: Optional[asyncio.Task] = None
+        self._claude_bridge_retitle_counts: Dict[str, int] = {}
+        self._claude_bridge_retitle_tasks: set = set()
 
     async def _close_claude_bridge(self) -> None:
         """Stop resident bridge subprocesses during gateway shutdown.
@@ -516,5 +527,87 @@ class ClaudeBridgeRunnerMixin:
             model = ""
         effort = effort.strip().lower() if isinstance(effort, str) else ""
         if not model and not effort:
-            return await self.claude_bridge.handle_message(event)
-        return await self.claude_bridge.handle_message(event, model=model, effort=effort)
+            reply = await self.claude_bridge.handle_message(event)
+        else:
+            reply = await self.claude_bridge.handle_message(
+                event, model=model, effort=effort
+            )
+        if reply is not None:
+            self._schedule_claude_bridge_retitle(event)
+        return reply
+
+    def _schedule_claude_bridge_retitle(self, event: MessageEvent) -> None:
+        """Count this bridge turn and re-title its Discord thread on every Nth.
+
+        Bridge turns never reach the native agent loop, so ``maybe_auto_title``
+        (agent/turn_context.py) never runs for them and a Hermes-created thread
+        keeps the opening-message excerpt it was born with for life. This lane
+        reuses the native titler and the adapter's own rename op to keep that
+        name tracking the work. Fire-and-forget: a rename must never sit on the
+        reply's path, and a failure to rename is cosmetic.
+        """
+        try:
+            from agent.title_generator import is_titleable_user_message
+
+            if event.get_command():
+                return
+            source = event.source
+            if not self._is_discord_auto_thread_lane(source):
+                return
+            text = (event.text or "").strip()
+            if not is_titleable_user_message(text):
+                return
+
+            counts = self._claude_bridge_retitle_counts
+            if counts is None:
+                counts = self._claude_bridge_retitle_counts = {}
+            key = channel_key(event)
+            count = counts.get(key, 0) + 1
+            counts[key] = count
+            if count % self._RETITLE_EVERY != 1:
+                return
+
+            task = asyncio.create_task(
+                self._retitle_claude_bridge_thread(source, text)
+            )
+            # Hold a strong reference: create_task keeps only a weak one, so an
+            # unreferenced task can be collected mid-run (same pattern as the
+            # outbox watcher task).
+            tasks = self._claude_bridge_retitle_tasks
+            if tasks is None:
+                tasks = self._claude_bridge_retitle_tasks = set()
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        except Exception:
+            logger.debug(
+                "claude_bridge: thread re-title scheduling failed", exc_info=True
+            )
+
+    async def _retitle_claude_bridge_thread(
+        self, source: SessionSource, text: str
+    ) -> None:
+        """Generate a title for ``text`` and rename ``source``'s Discord thread."""
+        try:
+            from agent.title_generator import generate_title
+
+            thread_id = str(getattr(source, "thread_id", "") or "")
+            if not thread_id:
+                return
+            # Sync auxiliary LLM call — off the event loop.
+            title = await asyncio.to_thread(generate_title, text)
+            if not title:
+                return
+            name = self._sanitize_discord_thread_title(title)
+            rename_thread = getattr(
+                self._adapter_for_source(source), "rename_thread", None
+            )
+            if rename_thread is None:
+                return
+            # No no-clobber guard on purpose: replacing the thread's current
+            # name is this lane's whole job.
+            await rename_thread(thread_id, name)
+            logger.info(
+                "claude_bridge: re-titled discord thread %s to %r", thread_id, name
+            )
+        except Exception:
+            logger.debug("claude_bridge: thread re-title failed", exc_info=True)
