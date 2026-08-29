@@ -119,7 +119,7 @@ def _get_subagent_approval_callback():
 # "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
 # — the model has no toolsets argument. Subagents inherit the parent's toolsets.
 
-_DEFAULT_MAX_CONCURRENT_CHILDREN = 3
+_DEFAULT_MAX_CONCURRENT_CHILDREN = 10
 # One-shot guard: the high-concurrency cost advisory is emitted at most once
 # per process. _get_max_concurrent_children() runs on every get_definitions()
 # schema rebuild (via _build_top_level_description / _build_tasks_param_description),
@@ -152,6 +152,44 @@ _active_subagents_lock = threading.Lock()
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
 
+# subagent_id -> {goal, delegation_id, parent_session_id} retained AFTER the
+# child finishes (bounded FIFO). Child-started background processes routinely
+# outlive the child itself (its npm ci with notify_on_complete=true finishes
+# after the child's summary was delivered); their completion notifications
+# reach the parent conversation via the shared completion_queue and need
+# delegation attribution even though the live registry entry is gone.
+_RECENT_SUBAGENTS_CAP = 200
+_recent_subagents: Dict[str, Dict[str, Any]] = {}
+
+
+def get_subagent_attribution(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Resolve a process task_id to its originating delegation, if any.
+
+    Children run their terminal sessions under ``task_id == subagent_id``
+    (see _run_single_child's child_task_id), so a background process spawned
+    by a subagent carries that id in ``ProcessSession.task_id``. Returns
+    ``{subagent_id, goal, delegation_id}`` for live AND recently-finished
+    children, or None when the task_id is not a known subagent.
+    """
+    if not task_id or not isinstance(task_id, str):
+        return None
+    with _active_subagents_lock:
+        record = _active_subagents.get(task_id)
+        if record is not None:
+            return {
+                "subagent_id": task_id,
+                "goal": record.get("goal"),
+                "delegation_id": record.get("delegation_id"),
+            }
+        retained = _recent_subagents.get(task_id)
+        if retained is not None:
+            return {
+                "subagent_id": task_id,
+                "goal": retained.get("goal"),
+                "delegation_id": retained.get("delegation_id"),
+            }
+    return None
+
 
 def set_spawn_paused(paused: bool) -> bool:
     """Globally block/unblock new delegate_task spawns.
@@ -179,11 +217,26 @@ def _register_subagent(record: Dict[str, Any]) -> None:
         _active_subagents[sid] = record
 
 
+def _retain_recent_subagent(record: Dict[str, Any]) -> None:
+    """Keep a bounded attribution stub after a child finishes (lock held)."""
+    sid = record.get("subagent_id")
+    if not sid:
+        return
+    _recent_subagents[sid] = {
+        "goal": record.get("goal"),
+        "delegation_id": record.get("delegation_id"),
+        "owner_agent_session_id": record.get("owner_agent_session_id"),
+    }
+    while len(_recent_subagents) > _RECENT_SUBAGENTS_CAP:
+        _recent_subagents.pop(next(iter(_recent_subagents)), None)
+
+
 def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
         if record is not None and (agent is None or record.get("agent") is agent):
             _active_subagents.pop(subagent_id, None)
+            _retain_recent_subagent(record)
 
 
 def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
@@ -350,6 +403,66 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 _CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
 
 
+def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
+    """Resolve a session id to the tip of its compression lineage.
+
+    Best-effort: uses the parent's live SessionDB handle when present so a
+    delegation dispatched before a compression rotation still matches the
+    rotated parent. Returns the input unchanged when resolution fails.
+    """
+    sid = str(session_id or "")
+    if not sid:
+        return ""
+    db = getattr(parent_agent, "_session_db", None)
+    if db is None:
+        return sid
+    try:
+        resolved = db.resolve_resume_session_id(sid)
+        return str(resolved) if resolved else sid
+    except Exception:
+        return sid
+
+
+def _owns_subagent_record(record: Dict[str, Any], parent_agent: Any) -> bool:
+    """True when *parent_agent*'s conversation owns this live-child record.
+
+    Two-tier check:
+
+    1. Object identity — the ``_delegate_parent_ref`` weakref chain stamped
+       at build time reaches *parent_agent*. Fast path for the common case
+       where the parent AIAgent object survives the whole run.
+    2. Durable conversation lineage — the child was registered with the
+       owning conversation's durable session id
+       (``owner_agent_session_id``); match it against the calling parent's
+       ``session_id``, resolving compression-rotation lineage on both sides.
+
+    Tier 2 exists because the identity chain is BRITTLE across parent-agent
+    rebuilds: the CLI sets ``self.agent = None`` mid-session (route-signature
+    change, credential refresh, /model, MoA one-shots) and constructs a NEW
+    AIAgent for the next turn while the child keeps running with a weakref to
+    the old object. The delivery path always survived this (it routes by
+    durable session id); the control path must use the same durable spine or
+    running children go invisible/unsteerable (observed live: deleg_88454b70
+    / sa-0-dc0100f4, 2026-08-17).
+    """
+    agent = record.get("agent")
+    if _is_descendant_of(agent, parent_agent):
+        return True
+    owner_sid = str(record.get("owner_agent_session_id") or "")
+    if not owner_sid:
+        return False
+    parent_sid = str(getattr(parent_agent, "session_id", "") or "")
+    if not parent_sid:
+        return False
+    if owner_sid == parent_sid:
+        return True
+    # Compression rotation on either side: compare lineage tips.
+    return _resolve_session_lineage(owner_sid, parent_agent) in {
+        parent_sid,
+        _resolve_session_lineage(parent_sid, parent_agent),
+    }
+
+
 def _handle_control_action(
     action: str,
     subagent_id: Optional[str],
@@ -368,7 +481,7 @@ def _handle_control_action(
         entries = []
         for r in records:
             agent = r.get("agent")
-            if not _is_descendant_of(agent, parent_agent):
+            if not _owns_subagent_record(r, parent_agent):
                 continue
             started = r.get("started_at")
             entries.append(
@@ -409,8 +522,7 @@ def _handle_control_action(
         )
     with _active_subagents_lock:
         record = _active_subagents.get(sid)
-        target_agent = record.get("agent") if record else None
-    if record is None or not _is_descendant_of(target_agent, parent_agent):
+    if record is None or not _owns_subagent_record(record, parent_agent):
         return tool_error(
             f"No live subagent '{sid}' in this conversation's spawn tree. It "
             "may have already finished (its result arrives as a normal "
@@ -733,7 +845,7 @@ def _normalize_role(r: Optional[str]) -> str:
 
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
-    DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
+    DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (10).
 
     Users can raise this as high as they want; only the floor (1) is enforced.
 
@@ -977,7 +1089,7 @@ def _preserve_parent_mcp_toolsets(
     return preserved
 
 
-DEFAULT_MAX_ITERATIONS = 50
+DEFAULT_MAX_ITERATIONS = 250
 # Hard per-summary character ceiling layered on top of the dynamic
 # headroom budget (see _apply_summary_budget). Belt-and-suspenders for
 # models that ignore the "be concise" instruction. 0 disables the ceiling.
@@ -1088,6 +1200,34 @@ def _build_child_system_prompt(
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
+        # Project context files (AGENTS.md / CLAUDE.md / .cursorrules ...)
+        # from the workspace, via the SAME discovery/priority/cap logic the
+        # main agent's system prompt uses. Children are constructed with
+        # skip_context_files=True (their prompt is this focused one), so
+        # without this a subagent works in a repo without the repo's own
+        # conventions unless it thinks to go read them. SOUL.md is skipped —
+        # identity belongs to the parent. workspace_path comes only from
+        # explicit sources (_resolve_workspace_hint: TERMINAL_CWD / agent cwd
+        # hints, never bare getcwd), so the #64590 install-tree-fallback leak
+        # doesn't apply here. Best-effort: on any failure the child prompt is
+        # simply built without the block.
+        try:
+            from agent.prompt_builder import build_context_files_prompt
+
+            _ctx_files = build_context_files_prompt(
+                cwd=str(workspace_path), skip_soul=True
+            )
+        except Exception:
+            logger.debug(
+                "subagent: workspace context-files load failed", exc_info=True
+            )
+            _ctx_files = ""
+        if _ctx_files.strip():
+            parts.append(
+                "\nThe workspace's project context files are reproduced "
+                "below. Their conventions and invariants are binding for "
+                "your work in this workspace.\n\n" + _ctx_files.strip()
+            )
     parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
@@ -1500,15 +1640,15 @@ def _build_child_agent(
     import uuid as _uuid
 
     # ── Role resolution ─────────────────────────────────────────────────
-    # Honor the caller's role only when BOTH the kill switch and the
-    # child's depth allow it.  This is the single point where role
-    # degrades to 'leaf' — keeps the rule predictable.  Callers pass
-    # the normalised role (_normalize_role ran in delegate_task) so
-    # we only deal with 'leaf' or 'orchestrator' here.
+    # Depth-derived, not caller-declared: a child may delegate iff the
+    # kill switch is on and depth budget remains below max_spawn_depth.
+    # The legacy `role` arg no longer participates (it asked the caller
+    # to guess a fact the config already knows); it is still accepted and
+    # normalised for wire compat, but capability comes from depth alone.
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
     max_spawn = _get_max_spawn_depth()
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
-    effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
+    effective_role = "orchestrator" if orchestrator_ok else "leaf"
 
     # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
     # subagent_id is generated here so the progress callback, the
@@ -1670,19 +1810,20 @@ def _build_child_agent(
     else:
         effective_api_mode = getattr(parent_agent, "api_mode", None)
     # Defensive: validate trusted delegation.command exists on PATH before
-    # honoring it. Stale config should not force a child onto the ACP transport
-    # and then fail at subprocess startup.
+    # honoring it. An explicitly pinned transport that cannot run must fail
+    # the spawn loudly (#80450) — silently falling back to the default
+    # transport would run the child somewhere the user explicitly routed it
+    # away from. Normally unreachable via delegate_task, which pre-validates
+    # the command in _resolve_delegation_credentials.
     if override_acp_command:
         import shutil as _shutil
 
         if not _shutil.which(override_acp_command):
-            logger.warning(
-                "Ignoring acp_command=%r: binary not found on PATH; "
-                "falling back to default transport.",
-                override_acp_command,
+            raise ValueError(
+                f"Pinned delegation command '{override_acp_command}' was not "
+                f"found on PATH. Install it or remove delegation.command from "
+                f"config.yaml."
             )
-            override_acp_command = None
-            override_acp_args = None
     effective_acp_command = override_acp_command or getattr(
         parent_agent, "acp_command", None
     )
@@ -1732,7 +1873,19 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    #
+    # EXCEPT when the user pinned delegation.provider: an explicit pin means
+    # "children run on THIS provider".  Inheriting the parent chain would let
+    # a mid-run auth/429 failure silently reroute the quiet-mode child onto
+    # the parent's fallback models with no surfaced signal (#80450) — the
+    # same class of silent-drag the override_provider filter-clearing below
+    # already prevents for OpenRouter routing preferences.  Predictability >
+    # liveness for explicit pins: the pinned child fails loudly instead.
+    parent_fallback = (
+        None
+        if override_provider
+        else (getattr(parent_agent, "_fallback_chain", None) or None)
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1772,51 +1925,100 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    # Each child gets a DEDICATED SessionDB connection instead of the parent's
+    # live object. The parent's handle is owned by the parent's lifecycle
+    # (cron run_job's finally block, gateway session end, /new) and can be
+    # closed while a fire-and-forget background child is still flushing on a
+    # daemon thread — every subsequent flush then hits the closed handle and
+    # the child's transcript is silently dropped (#81267). A dedicated handle
+    # can't be closed out from under the child; it is released by the child's
+    # own close() via the owned flag set below. It MUST point at the same
+    # database FILE as the parent's handle: parents can hold non-default
+    # per-profile handles (tui_gateway opens SessionDB(db_path=<profile>/
+    # state.db) for non-launch profiles), and a bare SessionDB() would write
+    # the child's transcript into the launch profile's db, breaking
+    # parent_session_id lineage and session_search. AsyncSessionDB wrappers
+    # (gateway) forward .db_path via __getattr__, so this works through them.
+    child_session_db = None
+    parent_session_db = getattr(parent_agent, "_session_db", None)
+    if parent_session_db is not None:
+        try:
+            from hermes_state import SessionDB
+
+            _parent_db_path = getattr(parent_session_db, "db_path", None)
+            child_session_db = (
+                SessionDB(db_path=_parent_db_path)
+                if _parent_db_path is not None
+                else SessionDB()
+            )
+        except Exception:
+            logger.debug(
+                "subagent: failed to open dedicated SessionDB; child persistence disabled",
+                exc_info=True,
+            )
+            child_session_db = None
+
     from agent.delegation_context import delegated_child_context
 
     with delegated_child_context():
-        child = AIAgent(
-            base_url=effective_base_url,
-            api_key=effective_api_key,
-            model=effective_model,
-            provider=effective_provider,
-            api_mode=effective_api_mode,
-            acp_command=effective_acp_command,
-            acp_args=effective_acp_args,
-            max_iterations=max_iterations,
+        try:
+            child = AIAgent(
+                base_url=effective_base_url,
+                api_key=effective_api_key,
+                model=effective_model,
+                provider=effective_provider,
+                api_mode=effective_api_mode,
+                acp_command=effective_acp_command,
+                acp_args=effective_acp_args,
+                max_iterations=max_iterations,
 
-            reasoning_config=child_reasoning,
-            prefill_messages=getattr(parent_agent, "prefill_messages", None),
-            fallback_model=parent_fallback,
-            enabled_toolsets=child_toolsets,
-            disabled_toolsets=child_disabled_toolsets,
-            quiet_mode=True,
-            ephemeral_system_prompt=child_prompt,
-            log_prefix=f"[subagent-{task_index}]",
-            platform="subagent",
-            skip_context_files=True,
-            skip_memory=True,
-            clarify_callback=None,
-            thinking_callback=child_thinking_cb,
-            session_db=getattr(parent_agent, "_session_db", None),
-            parent_session_id=getattr(parent_agent, "session_id", None),
-            providers_allowed=child_providers_allowed,
-            providers_ignored=child_providers_ignored,
-            providers_order=child_providers_order,
-            provider_sort=child_provider_sort,
-            provider_require_parameters=child_provider_require_parameters,
-            provider_data_collection=child_provider_data_collection,
-            request_overrides=(
-                dict(override_request_overrides or {})
-                if override_provider
-                else dict(getattr(parent_agent, "request_overrides", {}) or {})
-            ),
-            openrouter_min_coding_score=child_openrouter_min_coding_score,
-            tool_progress_callback=child_progress_cb,
-            iteration_budget=None,  # fresh budget per subagent
-            **child_optional_kwargs,
-        )
+                reasoning_config=child_reasoning,
+                prefill_messages=getattr(parent_agent, "prefill_messages", None),
+                fallback_model=parent_fallback,
+                enabled_toolsets=child_toolsets,
+                disabled_toolsets=child_disabled_toolsets,
+                quiet_mode=True,
+                ephemeral_system_prompt=child_prompt,
+                log_prefix=f"[subagent-{task_index}]",
+                platform="subagent",
+                skip_context_files=True,
+                skip_memory=True,
+                clarify_callback=None,
+                thinking_callback=child_thinking_cb,
+                session_db=child_session_db,
+                parent_session_id=getattr(parent_agent, "session_id", None),
+                providers_allowed=child_providers_allowed,
+                providers_ignored=child_providers_ignored,
+                providers_order=child_providers_order,
+                provider_sort=child_provider_sort,
+                provider_require_parameters=child_provider_require_parameters,
+                provider_data_collection=child_provider_data_collection,
+                request_overrides=(
+                    dict(override_request_overrides or {})
+                    if override_provider
+                    else dict(getattr(parent_agent, "request_overrides", {}) or {})
+                ),
+                openrouter_min_coding_score=child_openrouter_min_coding_score,
+                tool_progress_callback=child_progress_cb,
+                iteration_budget=None,  # fresh budget per subagent
+                **child_optional_kwargs,
+            )
+        except BaseException:
+            # Construction failed: the dedicated handle has no owner and no
+            # child close() will ever run — release it here so the sqlite fds
+            # don't outlive the failed spawn.
+            if child_session_db is not None:
+                try:
+                    child_session_db.close()
+                except Exception:
+                    pass
+            raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Ownership transfer for the dedicated handle: the child's close() must
+    # release it (nothing else holds a reference), and no parent teardown can
+    # close it out from under a background child (#81267).
+    if child_session_db is not None:
+        child._owns_session_db = True
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -2408,12 +2610,24 @@ def _run_single_child(
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
         _parent_sid = getattr(child, "_parent_subagent_id", None)
+        # Durable ownership spine: the OWNING CONVERSATION's session id (the
+        # same lineage the delivery path routes completions by). Sourced from
+        # the child's _parent_session_id stamp so it stays correct even when
+        # parent_agent has been rebuilt between dispatch and this run.
+        _owner_agent_session_id = (
+            str(getattr(child, "_parent_session_id", "") or "")
+            or str(getattr(parent_agent, "session_id", "") or "")
+        )
+        _delegation_id = getattr(child, "_delegation_id", None)
         _register_subagent(
             {
                 "subagent_id": _subagent_id,
                 "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
                 "depth": _tui_depth,
                 "goal": goal,
+                "delegation_id": (
+                    _delegation_id if isinstance(_delegation_id, str) else None
+                ),
                 "model": (
                     getattr(child, "model", None)
                     if isinstance(getattr(child, "model", None), str)
@@ -2423,6 +2637,11 @@ def _run_single_child(
                 "status": "running",
                 "tool_count": 0,
                 "agent": child,
+                # Durable conversation lineage for the model-facing control
+                # plane (list/steer/stop). The weakref identity chain breaks
+                # when the CLI rebuilds its AIAgent mid-session; this id is
+                # the same spine completion delivery routes by.
+                "owner_agent_session_id": _owner_agent_session_id or None,
                 # Immutable live gateway/TUI session that commissioned this
                 # child. Empty outside those hosts; RPC authority fails closed.
                 "owner_session_id": owner_session_id,
@@ -2446,8 +2665,35 @@ def _run_single_child(
                 subagent_worktree.finalize_subagent_worktree(_worktree_info)
             )
         except Exception as e:
-            logger.debug("worktree finalize failed: %s", e)
-            entry_dict["worktree"] = dict(_worktree_info)
+            # finalize is written hard not to raise, but if it ever does the
+            # state is unknown — emit the SAME schema the parent expects,
+            # flagged, via the shared factory so the two producers of this
+            # payload can never drift.
+            logger.warning("worktree finalize failed: %s", e)
+            try:
+                from tools import subagent_worktree as _sw
+
+                entry_dict["worktree"] = _sw.unproven_worktree_payload(
+                    _worktree_info, f"finalize raised: {e}"
+                )
+            except Exception:
+                # Import itself failed — inline the same shape rather than
+                # dropping the flag (the parent must still see the warning).
+                entry_dict["worktree"] = {
+                    "path": _worktree_info.get("path", ""),
+                    "branch": _worktree_info.get("branch", ""),
+                    "commits": 0,
+                    "dirty": False,
+                    "pruned": False,
+                    "inspection_failed": True,
+                    "note": (
+                        f"worktree finalize raised ({e}) and the reporting "
+                        "helper was unavailable: 'commits' and 'dirty' are "
+                        "UNKNOWN, not zero/clean. Inspect "
+                        f"{_worktree_info.get('path', '')} before assuming "
+                        "no work."
+                    ),
+                }
 
     try:
         _heartbeat_thread.start()
@@ -2870,6 +3116,13 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
+            # Explicit, parent-visible truncation flag. A subagent that
+            # exhausts its per-child iteration budget still returns a summary,
+            # so `status` stays "completed" (see above) — without this the
+            # parent can't tell truncated-but-summarized from cleanly-finished
+            # work except by parsing the summary prose. exit_reason is computed
+            # authoritatively from the child's `completed` flag.
+            "truncated": exit_reason == "max_iterations",
             "tokens": {
                 "input": (
                     _input_tokens if isinstance(_input_tokens, (int, float)) else 0
@@ -3327,19 +3580,16 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     """Validate a tasks=[...] batch beyond per-task goal presence.
 
     Returns an actionable error string, or None when the batch is valid.
-    Batch-only by design: the single-`goal` form legitimately uses short
-    goals, so these checks must never run on it.
+
+    A one-entry array is the canonical single-task shape (the advertised
+    interface is tasks-only; legacy top-level `goal` is wrapped into a
+    one-entry batch), so no minimum count is enforced. The placeholder/
+    template checks below still run on every entry.
 
     Duplicate goals are deliberately NOT rejected: identical-goal fan-outs
     are a legitimate pattern (best-of-N / ensemble sampling), and blocking
     them broke real workflows (post-merge audit of #81141).
     """
-    if len(task_list) < 2:
-        return (
-            "Batch mode requires at least 2 tasks. For a single task, use "
-            "the `goal` parameter instead of `tasks`: "
-            'delegate_task(goal="...", context="...").'
-        )
 
     for i, task in enumerate(task_list):
         goal = str(task.get("goal", "")).strip()
@@ -3359,7 +3609,11 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
                 "calling delegate_task — subagents cannot resolve "
                 "placeholders."
             )
-        if len(goal) < _MIN_BATCH_GOAL_LEN:
+        if len(goal) < _MIN_BATCH_GOAL_LEN and len(task_list) >= 2:
+            # Multi-task fan-outs with terse goals are usually unexpanded
+            # templates; a SINGLE task legitimately uses short goals
+            # ("Fix the tests"), so one-entry arrays keep the historical
+            # single-`goal` exemption.
             return (
                 f"Task {i} goal is too short ({goal!r}). Write a specific, "
                 "self-contained goal of at least "
@@ -3381,6 +3635,7 @@ def delegate_task(
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
     parent_agent=None,
+    credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -3474,8 +3729,16 @@ def delegate_task(
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
+    #
+    # ``credentials_cfg`` (internal callers only — never model-facing) is a
+    # per-call override shaped like the delegation config section
+    # ({provider, model, base_url, api_key, api_mode}); the /review engine
+    # uses it to route its reviewer subagent onto ``auxiliary.review``
+    # without touching the global delegation pin.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _resolve_delegation_credentials(
+            credentials_cfg if credentials_cfg else cfg, parent_agent
+        )
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -3510,7 +3773,11 @@ def delegate_task(
             single_task["output_schema"] = output_schema
         task_list = [single_task]
     else:
-        return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
+        return tool_error(
+            "No tasks provided. Pass tasks=[{goal: '...', context: '...'}, "
+            "...] — one entry per subagent (a single task is a one-entry "
+            "array)."
+        )
 
     if not task_list:
         return tool_error("No tasks provided.")
@@ -3570,7 +3837,7 @@ def delegate_task(
     )
 
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context
+        task_list, context, model=creds.get("model"), provider=creds.get("provider")
     )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
@@ -3612,27 +3879,32 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
-        child = _build_child_preserving_parent_tools(
-            task_index=i,
-            goal=t["goal"],
-            context=_child_context,
-            # Subagents always inherit the parent's toolsets; the model
-            # cannot choose or narrow them (no model-facing toolsets arg).
-            toolsets=None,
-            model=creds["model"],
-            max_iterations=effective_max_iter,
-            task_count=n_tasks,
-            parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
-            role=effective_role,
-        )
+        try:
+            child = _build_child_preserving_parent_tools(
+                task_index=i,
+                goal=t["goal"],
+                context=_child_context,
+                # Subagents always inherit the parent's toolsets; the model
+                # cannot choose or narrow them (no model-facing toolsets arg).
+                toolsets=None,
+                model=creds["model"],
+                max_iterations=effective_max_iter,
+                task_count=n_tasks,
+                parent_agent=parent_agent,
+                override_provider=creds["provider"],
+                override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"],
+                override_api_mode=creds["api_mode"],
+                override_request_overrides=creds.get("request_overrides"),
+                override_max_tokens=creds.get("max_output_tokens"),
+                override_acp_command=creds.get("command"),
+                override_acp_args=creds.get("args"),
+                role=effective_role,
+            )
+        except ValueError as exc:
+            # Explicit-pin preflight failures (e.g. pinned delegation.command
+            # missing from PATH) refuse the spawn loudly (#80450).
+            return tool_error(str(exc))
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
         if _task_schema is not None:
@@ -3651,6 +3923,10 @@ def delegate_task(
                 getattr(child, "tool_progress_callback", None), _writer
             )
             child._live_transcript_path = str(_writer.path)
+        # Delegation identity for the live registry + process-notification
+        # attribution (child-started background processes report under it).
+        if live_deleg_id:
+            setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
@@ -4295,6 +4571,20 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             f"Set the appropriate environment variable or run 'hermes auth'."
         )
 
+    # A pinned ACP transport command must exist — refuse the spawn loudly
+    # rather than letting the child silently fall back to another transport
+    # (#80450).
+    pinned_command = runtime.get("command")
+    if pinned_command:
+        import shutil as _shutil
+
+        if not _shutil.which(pinned_command):
+            raise ValueError(
+                f"Delegation provider '{configured_provider}' is pinned to the "
+                f"'{pinned_command}' command, which was not found on PATH. "
+                f"Install it or choose a different delegation provider."
+            )
+
     return {
         "model": configured_model or runtime.get("model") or None,
         "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
@@ -4363,20 +4653,45 @@ def _build_top_level_description() -> str:
     top-level text stays static and duplication-free. If you add text
     here, check it is not already stated in a parameter description.
     """
+    try:
+        orchestration_available = _get_max_spawn_depth() >= 2 and _get_orchestrator_enabled()
+    except Exception:
+        orchestration_available = False
+
+    # The child-restrictions rule renders per config: on nesting-enabled
+    # installs the orchestrator clause is load-bearing; on depth-1/disabled
+    # installs (the default) it would describe an unreachable state — the
+    # role param already explains that 'orchestrator' is inert there.
+    # send_message is deliberately not named: it's gateway-internal
+    # vocabulary most sessions never see. The list below is the fail-safe
+    # superset; model_tools session-filters it to the tools the session
+    # actually has, dropping the whole line when none apply.
+    # Delegation capability is depth-derived (no role param): mention
+    # recursion only where it's actually available.
+    if orchestration_available:
+        restrictions_rule = (
+            "- Children cannot call clarify, memory, or cronjob.\n"
+            "- Children can themselves delegate while depth remains "
+            f"(max_spawn_depth={_get_max_spawn_depth()}); the runtime "
+            "derives this from depth automatically.\n"
+        )
+    else:
+        restrictions_rule = (
+            "- Children cannot call delegate_task, clarify, memory, or "
+            "cronjob.\n"
+        )
+
     return (
         "Spawn subagents in isolated contexts; each gets its own conversation, "
         "terminal session, and toolset, and only its final summary returns to "
-        "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
-        "(limits and nesting rules are in the parameter descriptions).\n\n"
+        "you. Pass every task in `tasks` — one entry spawns one subagent, "
+        "several run in parallel (limit in the tasks description).\n\n"
         "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
-        "LIVE ORCHESTRATION: while children run, this tool also controls "
-        "them — action='list' (live children + ids), action='steer' "
-        "(subagent_id + message, redirect without stopping), action='stop' "
-        "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
+        "transcript paths, and the completed result (one consolidated message, "
+        "results in task order) re-enters the conversation on its own. Do NOT "
+        "wait or poll; continue other work. While children run, `action` "
+        "(list/steer/stop) controls them live — steer when a transcript shows "
+        "a child drifting.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4384,7 +4699,7 @@ def _build_top_level_description() -> str:
         "- A single tool call -> call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot ask questions\n"
         "- Durable work that must survive this session -> cronjob or "
-        "terminal(background=True, notify_on_complete=True); /stop, /new, or "
+        "terminal(background=True, notify=True); /stop, /new, or "
         "process exit discards running subagents.\n\n"
         "RULES:\n"
         "- Children know nothing of this conversation: pass everything needed "
@@ -4394,14 +4709,10 @@ def _build_top_level_description() -> str:
         "claiming \"uploaded successfully\" or \"file written\" may be wrong. "
         "For external side effects (uploads, remote writes, publishing), "
         "require a verifiable handle (URL, ID, absolute path) and verify it "
-        "yourself — fetch the URL, stat the file, read back the content — "
-        "before telling the user the operation succeeded.\n"
-        "- Leaf children (the default) cannot call delegate_task, clarify, "
-        "memory, send_message, or cronjob; orchestrators regain only "
-        "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
-        "Results are returned as an array, one entry per task."
+        "yourself before telling the user the operation succeeded.\n"
+        + restrictions_rule +
+        "- Children inherit the parent model unless pinned via "
+        "delegation.provider / delegation.model in config.yaml."
     )
 
 
@@ -4412,47 +4723,31 @@ def _build_tasks_param_description() -> str:
     except Exception:
         max_children = _DEFAULT_MAX_CONCURRENT_CHILDREN
     return (
-        f"Batch mode: tasks to run in parallel (up to {max_children} for this "
-        f"user, set via delegation.max_concurrent_children). Each gets "
-        "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        f"The task(s), up to {max_children} in parallel for this user (set "
+        "via delegation.max_concurrent_children). Each entry spawns one "
+        "subagent with isolated context and terminal session; a single task "
+        "is a one-entry array. Required when spawning."
     )
 
 
 def _build_role_param_description() -> str:
-    """Compose the 'role' parameter description with current spawn-depth limit."""
+    """Legacy helper — the `role` param is no longer advertised.
+
+    Delegation capability is depth-derived (see the role-resolution block in
+    _build_child_agent): a child may itself delegate iff
+    delegation.orchestrator_enabled and its depth < max_spawn_depth. The
+    handler still accepts role for wire compat (old transcripts, kanban
+    dispatcher) but ignores it. Kept because external callers import this
+    symbol; returns the depth story for any such use.
+    """
     try:
         max_depth = _get_max_spawn_depth()
     except Exception:
         max_depth = MAX_DEPTH
-    try:
-        orchestrator_on = _get_orchestrator_enabled()
-    except Exception:
-        orchestrator_on = True
-
-    if max_depth >= 2 and orchestrator_on:
-        nesting_note = (
-            f"Nesting IS enabled for this user (max_spawn_depth={max_depth}): "
-            f"orchestrator children can themselves delegate up to {max_depth - 1} "
-            "more level(s) deep."
-        )
-    elif max_depth >= 2 and not orchestrator_on:
-        nesting_note = (
-            "Nesting is currently disabled "
-            "(delegation.orchestrator_enabled=false); 'orchestrator' is "
-            "silently forced to 'leaf'."
-        )
-    else:
-        nesting_note = (
-            f"Nesting is OFF for this user (max_spawn_depth={max_depth}); "
-            "'orchestrator' is silently forced to 'leaf'. Raise "
-            "delegation.max_spawn_depth in config.yaml to enable."
-        )
-
     return (
-        "Role of the child agent. 'leaf' (default) = focused "
-        "worker, cannot delegate further. 'orchestrator' = can "
-        f"use delegate_task to spawn its own workers. {nesting_note}"
+        "Legacy parameter, ignored: whether a child can delegate is derived "
+        f"from delegation config (max_spawn_depth={max_depth}), not declared "
+        "by the caller."
     )
 
 
@@ -4471,7 +4766,6 @@ def _build_dynamic_schema_overrides() -> dict:
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
-    overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
     return {
         "description": _build_top_level_description(),
@@ -4497,48 +4791,44 @@ DELEGATE_TASK_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "goal": {
-                "type": "string",
-                "description": (
-                    "What the subagent should accomplish. Be specific and "
-                    "self-contained -- the subagent knows nothing about your "
-                    "conversation history."
-                ),
-            },
-            "context": {
-                "type": "string",
-                "description": (
-                    "Background information the subagent needs: file paths, "
-                    "error messages, project structure, constraints. The more "
-                    "specific you are, the better the subagent performs."
-                ),
-            },
+            # NOTE: the handler also accepts the legacy single-goal shape —
+            # top-level `goal` (string), `context` (string), `output_schema`
+            # (object) — wrapped into a one-entry batch at dispatch. Legacy,
+            # unadvertised (old transcripts/callers only); tasks=[...] is the
+            # only advertised shape. Do not re-add these to the schema.
             "tasks": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "goal": {"type": "string", "description": "Task goal"},
+                        "goal": {
+                            "type": "string",
+                            "description": (
+                                "What this subagent should accomplish. Be "
+                                "specific and self-contained — it knows "
+                                "nothing about your conversation history."
+                            ),
+                        },
                         "context": {
                             "type": "string",
-                            "description": "Task-specific context",
-                        },
-                        "role": {
-                            "type": "string",
-                            "enum": ["leaf", "orchestrator"],
-                            "description": "Per-task role override. See top-level 'role' for semantics.",
+                            "description": (
+                                "Background THIS child needs: file paths, "
+                                "error messages, constraints. Each child "
+                                "sees only its own context — repeat shared "
+                                "background in every task that needs it."
+                            ),
                         },
                         "output_schema": {
                             "type": "object",
                             "description": (
-                                "Optional JSON Schema the subagent's final "
-                                "answer must validate against. The child is "
-                                "told the contract up front; the parent "
-                                "validates the final answer and allows one "
-                                "bounded correction retry. The result entry "
-                                "gains schema_valid (and schema_errors on "
-                                "final failure). Keep schemas forgiving: "
-                                "require only fields you will actually read."
+                                "Optional JSON Schema this child's final "
+                                "answer must validate against (told to the "
+                                "child up front; parent validates with one "
+                                "bounded correction retry; result gains "
+                                "schema_valid, plus schema_errors on "
+                                "failure). Keep it forgiving — require only "
+                                "fields you will read."
                             ),
                         },
                     },
@@ -4547,63 +4837,41 @@ DELEGATE_TASK_SCHEMA = {
                 # No maxItems — the runtime limit is configurable via
                 # delegation.max_concurrent_children (default 3) and
                 # enforced with a clear error in delegate_task().
+                # NOTE: the handler also accepts a per-task `role` — legacy,
+                # ignored: delegation capability is depth-derived, not
+                # caller-declared. Unadvertised on purpose; do not re-add.
                 "description": "(rebuilt at get_definitions() time)",
             },
-            "role": {
-                "type": "string",
-                "enum": ["leaf", "orchestrator"],
-                "description": "(rebuilt at get_definitions() time)",
-            },
-            "output_schema": {
-                "type": "object",
-                "description": (
-                    "Optional JSON Schema for the single-goal form — the "
-                    "subagent's final answer must validate against it "
-                    "(same semantics as tasks[].output_schema)."
-                ),
-            },
-            "background": {
-                "type": "boolean",
-                "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
-                ),
-            },
+            # NOTE: the handler also accepts `background` (bool) — DEPRECATED,
+            # ignored: top-level delegations always run in the background.
+            # Deliberately unadvertised (old transcripts/callers only); do not
+            # re-add to the schema.
             "action": {
                 "type": "string",
                 "enum": ["spawn", "list", "steer", "stop"],
                 "description": (
-                    "Default 'spawn' (omit for normal delegation). Live "
-                    "orchestration of running subagents: 'list' shows this "
-                    "conversation's live children (ids, goals, status, "
-                    "transcript paths); 'steer' queues course-correction text "
-                    "into one child (requires subagent_id + message) without "
-                    "stopping it; 'stop' ends one child early (requires "
-                    "subagent_id) — its partial result still returns as a "
-                    "completion message. Control actions return immediately; "
-                    "goal/tasks are ignored when action is not 'spawn'."
+                    "Default 'spawn'. Live control of running children: "
+                    "'list' = ids/goals/status/transcripts; 'steer' = queue "
+                    "course-correction text into one child (subagent_id + "
+                    "message) without stopping it; 'stop' = end one child "
+                    "early (subagent_id; partial result still returns). "
+                    "Control actions return immediately; goal/tasks are "
+                    "ignored unless spawning."
                 ),
             },
             "subagent_id": {
                 "type": "string",
                 "description": (
-                    "Target for action='steer'/'stop'. Ids are returned in the "
-                    "spawn dispatch response (subagent_ids) and by "
-                    "action='list'."
+                    "Target for action='steer'/'stop' (ids from the spawn "
+                    "response or action='list')."
                 ),
             },
             "message": {
                 "type": "string",
                 "description": (
-                    "For action='steer': the course correction. Be directive "
-                    "and specific — the child sees it appended to its next "
-                    "tool result mid-run (e.g. \"Stop exploring X; focus on Y "
-                    "and return early results\")."
+                    "For action='steer': the course correction, appended to "
+                    "the child's next tool result mid-run. Be directive and "
+                    "specific."
                 ),
             },
         },

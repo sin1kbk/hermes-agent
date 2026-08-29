@@ -171,7 +171,11 @@ class ClaudeBridgeRunnerMixin:
                 session_override.get("provider") or ""
             ).strip().lower()
 
-        from gateway.run import _get_channel_override, _load_gateway_runtime_config
+        from gateway.run import (
+            _get_channel_override,
+            _load_gateway_runtime_config,
+            _profile_runtime_scope,
+        )
 
         config = getattr(self, "config", None)
         channel_provider = ""
@@ -196,7 +200,12 @@ class ClaudeBridgeRunnerMixin:
             ).strip().lower()
 
         try:
-            runtime_config = _load_gateway_runtime_config()
+            if getattr(config, "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(normalized_source)
+                with _profile_runtime_scope(profile_home):
+                    runtime_config = _load_gateway_runtime_config()
+            else:
+                runtime_config = _load_gateway_runtime_config()
         except Exception:
             logger.warning(
                 "Failed to load model.provider for message routing: "

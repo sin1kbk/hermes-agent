@@ -174,10 +174,16 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
     stopped = SimpleNamespace(returncode=0, stdout="", stderr="")
 
     daemon = cua_backend._EmbeddedCuaDaemon("cua-driver", "unrestricted")
-    with patch.object(
+    with patch.object(cua_backend.sys, "platform", "linux"), patch.object(
         cua_backend,
         "_resolve_mcp_invocation",
         return_value=("/opt/cua-driver", ["mcp"]),
+    ), patch.object(
+        # This test pins the socket/ack contract, not overlay policy. Pin the
+        # policy off so the environment-dependent auto-detect (headless CI vs
+        # Wayland dev box) can't add a `--help` capability-probe subprocess.run
+        # call that the fixed two-entry side_effect below doesn't budget for.
+        cua_backend, "_cua_no_overlay", return_value=False,
     ), patch.object(cua_backend.subprocess, "Popen", return_value=process) as popen, patch.object(
         cua_backend.subprocess, "run", side_effect=[status, stopped]
     ):
@@ -205,3 +211,119 @@ def test_standard_backend_does_not_spawn_an_embedded_daemon():
 
     assert standard._embedded_daemon is None
     assert unrestricted._embedded_daemon is not None
+
+
+def test_standard_existing_profile_grant_owns_private_macos_runtime():
+    from tools.computer_use.cua_backend import _standard_runtime_launch_args
+
+    args, socket_path = _standard_runtime_launch_args(
+        ["mcp"],
+        grant_existing_profile=True,
+        platform="darwin",
+        socket_path="/tmp/hermes-cua-test.sock",
+    )
+
+    assert args == [
+        "mcp",
+        "--grant",
+        "existing-profile",
+        "--socket",
+        "/tmp/hermes-cua-test.sock",
+    ]
+    assert socket_path == "/tmp/hermes-cua-test.sock"
+
+
+def test_standard_existing_profile_grant_stays_in_process_off_macos():
+    from tools.computer_use.cua_backend import _standard_runtime_launch_args
+
+    args, socket_path = _standard_runtime_launch_args(
+        ["mcp"], grant_existing_profile=True, platform="linux"
+    )
+
+    assert args == ["mcp", "--grant", "existing-profile"]
+    assert socket_path is None
+
+
+def test_transport_reset_invalidates_native_capabilities():
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    backend = CuaDriverBackend(permission_mode="standard")
+    backend._active_pid = 10
+    backend._active_window_id = 20
+    backend._snapshot_tokens = {1: "old-token"}
+
+    backend._handle_transport_reset()
+
+    assert backend._active_pid is None
+    assert backend._active_window_id is None
+    assert backend._snapshot_tokens == {}
+
+
+# ── the escalation is at least audible ──────────────────────────────────
+
+
+def test_bypass_escalation_is_warned_once_per_session(caplog):
+    """`-z` reads as "don't prompt me" but also drops the driver's ceiling.
+
+    That widening is deliberate and unrestricted is reachable no other way,
+    but it is easy to trigger by accident: a script takes -z for quiet output
+    and loses its limits as a side effect. It must not be silent.
+    """
+    import logging
+
+    from tools.computer_use import tool as computer_use
+
+    computer_use._escalation_warned.clear()
+    with patch(
+        "tools.approval.is_approval_bypass_active_for_session",
+        return_value=True,
+    ):
+        with caplog.at_level(logging.WARNING, logger=computer_use.logger.name):
+            assert computer_use._cua_permission_mode("session-warn") == "unrestricted"
+            assert computer_use._cua_permission_mode("session-warn") == "unrestricted"
+
+    escalation = [
+        r for r in caplog.records if "escalated the cua-driver" in r.getMessage()
+    ]
+    assert len(escalation) == 1, "warning must fire once, not on every dispatch"
+    message = escalation[0].getMessage()
+    assert "standard" in message
+    assert "unrestricted" in message
+
+
+def test_no_escalation_warning_without_a_bypass(caplog):
+    import logging
+
+    from tools.computer_use import tool as computer_use
+
+    computer_use._escalation_warned.clear()
+    with patch(
+        "tools.approval.is_approval_bypass_active_for_session",
+        return_value=False,
+    ):
+        with caplog.at_level(logging.WARNING, logger=computer_use.logger.name):
+            assert computer_use._cua_permission_mode("session-quiet") == "standard"
+
+    assert not [
+        r for r in caplog.records if "escalated the cua-driver" in r.getMessage()
+    ]
+
+
+def test_each_session_is_warned_separately(caplog):
+    import logging
+
+    from tools.computer_use import tool as computer_use
+
+    computer_use._escalation_warned.clear()
+    with patch(
+        "tools.approval.is_approval_bypass_active_for_session",
+        return_value=True,
+    ):
+        with caplog.at_level(logging.WARNING, logger=computer_use.logger.name):
+            computer_use._cua_permission_mode("session-one")
+            computer_use._cua_permission_mode("session-two")
+
+    escalation = [
+        r for r in caplog.records if "escalated the cua-driver" in r.getMessage()
+    ]
+    assert len(escalation) == 2

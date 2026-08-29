@@ -57,7 +57,7 @@ else
     INSTALL_DIR_EXPLICIT=false
 fi
 PYTHON_VERSION="3.11"
-NODE_VERSION="22"
+NODE_VERSION="26"
 
 # FHS-style root install layout (set by resolve_install_layout when applicable):
 #   code at /usr/local/lib/hermes-agent, command at /usr/local/bin/hermes,
@@ -786,20 +786,118 @@ check_git() {
     exit 1
 }
 
-# The dependency tree's real Node floor is >=22.22.0, set by react-router 8.3.0
-# (`engines.node`), with Vite ^8 next at `^20.19 || >=22.12`. Keep this in sync
-# with the root package.json — a gate looser than the manifest lets an install
-# proceed to a `npm ci` that then dies with EBADENGINE, and a gate stricter than
-# the manifest replaces a working user toolchain for nothing. Returns 0 when the
-# given `node --version` string clears the floor; anything below it is replaced
-# with the Hermes-managed Node $NODE_VERSION.
+# Node deps below (install_node_deps) build native addons — most notably
+# node-pty, which every install needs — via node-gyp. node-gyp needs a C/C++
+# toolchain (make + a compiler); Python and make are already covered by
+# check_python/check_node's prerequisites, but the compiler itself was never
+# checked, so a missing g++/clang++ only surfaced as a wall of node-gyp/make
+# output deep inside `npm install`, with no earlier, actionable warning.
+# Best-effort like install_system_packages: warns and lets the caller decide
+# whether to proceed rather than aborting the whole install (unlike git,
+# which is hard-required much earlier for clone_repo).
+check_cxx_compiler() {
+    log_info "Checking for a C++ compiler (needed to build native Node modules like node-pty)..."
+
+    if command -v g++ &> /dev/null || command -v clang++ &> /dev/null; then
+        log_success "C++ compiler found"
+        HAS_CXX_COMPILER=true
+        return 0
+    fi
+
+    HAS_CXX_COMPILER=false
+    log_warn "No C++ compiler found"
+
+    case "$OS" in
+        macos)
+            # Same Command Line Tools path as attempt_install_git — CLT provides
+            # git AND a compiler, so this is usually already satisfied by the
+            # check_git step above. Handles the case where git was present
+            # without CLT (e.g. installed via Homebrew) so CLT never triggered.
+            log_info "Attempting to install Xcode Command Line Tools (provides a C++ compiler)..."
+            log_info "If a macOS dialog appears, click \"Install\" and accept the license."
+            xcode-select --install >/dev/null 2>&1 || true
+            local waited=0
+            local timeout=900
+            while [ "$waited" -lt "$timeout" ]; do
+                if command -v g++ &> /dev/null || command -v clang++ &> /dev/null; then
+                    log_success "C++ compiler installed"
+                    HAS_CXX_COMPILER=true
+                    return 0
+                fi
+                sleep 5
+                waited=$((waited + 5))
+                if [ $((waited % 60)) -eq 0 ]; then
+                    log_info "Still waiting for Command Line Tools install ($((waited / 60))m)..."
+                fi
+            done
+            ;;
+        linux)
+            local sudo_cmd=""
+            if [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ]; then
+                command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+            fi
+            log_info "Attempting to install a C++ compiler automatically..."
+            case "$DISTRO" in
+                ubuntu|debian)
+                    log_info "Installing build-essential via apt..."
+                    $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+                    $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential >/dev/null 2>&1 || true
+                    ;;
+                fedora)
+                    log_info "Installing gcc-c++ via dnf..."
+                    $sudo_cmd dnf install -y gcc-c++ >/dev/null 2>&1 || true
+                    ;;
+                arch)
+                    log_info "Installing base-devel via pacman..."
+                    $sudo_cmd pacman -S --noconfirm base-devel >/dev/null 2>&1 || true
+                    ;;
+            esac
+            if command -v g++ &> /dev/null || command -v clang++ &> /dev/null; then
+                log_success "C++ compiler installed"
+                HAS_CXX_COMPILER=true
+                return 0
+            fi
+            ;;
+    esac
+
+    log_warn "Could not install a C++ compiler automatically."
+    log_warn "Node steps that compile native modules (e.g. node-pty) will fail below until one is installed."
+    log_info "Install it manually, then re-run this installer:"
+    case "$OS" in
+        linux)
+            case "$DISTRO" in
+                ubuntu|debian) log_info "  sudo apt install build-essential" ;;
+                fedora)        log_info "  sudo dnf install gcc-c++" ;;
+                arch)          log_info "  sudo pacman -S base-devel" ;;
+                *)             log_info "  Install a C++ compiler (g++/gcc-c++) via your package manager" ;;
+            esac
+            ;;
+        android)
+            log_info "  pkg install clang"
+            ;;
+        macos)
+            log_info "  xcode-select --install"
+            ;;
+    esac
+    return 1
+}
+
+# The dependency tree supports Node 22.22+, 24.11+, and 26+. nanoid 6 excludes
+# Node 23 and 25 while its >=26 arm accepts later releases, and @babel/* 8.x
+# requires ^22.18.0 || >=24.11.0 — so accepting 23/25 or an early Node 24
+# here only defers the failure to `npm ci` under engine-strict. Keep this in
+# sync with the root package.json. Anything outside the supported lines is
+# replaced with the Hermes-managed Node $NODE_VERSION.
 node_satisfies_build() {
     local ver="${1#v}"
+    case "$ver" in *-*) return 1 ;; esac
     local major="${ver%%.*}"
     local minor="${ver#*.}"; minor="${minor%%.*}"
     case "$major" in ''|*[!0-9]*) return 1 ;; esac
     case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
-    if [ "$major" -ge 22 ] && { [ "$major" -gt 22 ] || [ "$minor" -ge 22 ]; }; then return 0; fi
+    if [ "$major" -eq 22 ] && [ "$minor" -ge 22 ]; then return 0; fi
+    if [ "$major" -eq 24 ] && [ "$minor" -ge 11 ]; then return 0; fi
+    if [ "$major" -ge 26 ]; then return 0; fi
     return 1
 }
 
@@ -867,7 +965,7 @@ check_node() {
     if command -v node &> /dev/null && ! command -v npm &> /dev/null; then
         log_warn "node found but npm is not on PATH (stray node symlink?) — installing Hermes-managed Node $NODE_VERSION LTS..."
     elif command -v node &> /dev/null; then
-        log_warn "Node.js $(node --version) is too old (Hermes requires Node >=26) — installing Hermes-managed Node $NODE_VERSION..."
+        log_warn "Node.js $(node --version) is unsupported (Hermes requires Node 22.22+, 24.11+, or 26+) — installing Hermes-managed Node $NODE_VERSION..."
     elif [ "$DISTRO" = "termux" ]; then
         log_info "Node.js not found — installing Node.js via pkg..."
     else
@@ -1384,6 +1482,13 @@ EOF
     cd "$INSTALL_DIR"
 
     if [ -n "$INSTALL_COMMIT" ]; then
+        # Validate the commit argument: must look like a hex SHA (full 40-char
+        # or abbreviated 7-39 char). Reject anything else early so the user
+        # gets a clear error instead of a misleading git message (#87268).
+        if ! printf '%s' "$INSTALL_COMMIT" | grep -qE '^[0-9a-fA-F]{7,40}$'; then
+            log_error "--commit expects a hex SHA (7-40 chars), got: $INSTALL_COMMIT"
+            return 1
+        fi
         # A commit pin must never move an existing install BACKWARDS. The
         # bootstrap installer bakes its build-time commit into the binary
         # (BUILD_PIN_COMMIT) and passes it as --commit on every install-mode
@@ -1393,21 +1498,32 @@ EOF
         # current venv. Only pin when the target is not already an ancestor of
         # HEAD; a fresh clone has no such ancestry and pins normally.
         if ! git cat-file -e "$INSTALL_COMMIT^{commit}" 2>/dev/null; then
-            git fetch origin "$INSTALL_COMMIT" || true
+            if ! git fetch origin "$INSTALL_COMMIT"; then
+                log_error "Could not fetch commit $INSTALL_COMMIT from origin."
+                log_error "Abbreviated SHAs are not supported — use the full 40-char hash."
+                log_error "Find it with: git ls-remote origin | grep <short-sha>"
+                return 1
+            fi
         fi
         if git rev-parse --verify --quiet HEAD >/dev/null 2>&1 \
            && git merge-base --is-ancestor "$INSTALL_COMMIT" HEAD 2>/dev/null \
            && [ "$(git rev-parse "$INSTALL_COMMIT^{commit}" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
             if [ "$FORCE_COMMIT" = true ]; then
                 log_warn "--force-commit: rolling this install back to $INSTALL_COMMIT."
-                git checkout --detach "$INSTALL_COMMIT"
+                if ! git checkout --detach "$INSTALL_COMMIT"; then
+                    log_error "Failed to detach at $INSTALL_COMMIT"
+                    return 1
+                fi
             else
                 log_warn "Ignoring --commit $INSTALL_COMMIT: the checkout is already newer."
                 log_warn "Pinning to it would roll this install back. Pass --force-commit to override."
             fi
         else
             log_info "Pinning checkout to commit $INSTALL_COMMIT..."
-            git checkout --detach "$INSTALL_COMMIT"
+            if ! git checkout --detach "$INSTALL_COMMIT"; then
+                log_error "Failed to detach at $INSTALL_COMMIT"
+                return 1
+            fi
         fi
     fi
 
@@ -1455,6 +1571,30 @@ setup_venv() {
     fi
 
     log_success "Virtual environment ready (Python $PYTHON_VERSION)"
+}
+
+run_locked_uv_sync() {
+    # Bootstrap uv calls stay isolated from ambient config via UV_NO_CONFIG
+    # (#21269). A locked project sync is different: uv.lock records resolver
+    # settings from this checkout's [tool.uv], so hiding pyproject.toml makes
+    # uv 0.12+ reject the valid lock. Re-enable project discovery only for
+    # this subprocess while redirecting user/system config lookups to an empty
+    # directory. Keep HOME unchanged so caches, credentials, and git continue
+    # to work normally.
+    local project_env="$1"
+    local isolated_uv_config
+    local sync_rc
+    isolated_uv_config="$(mktemp -d)" || return 1
+
+    (
+        unset UV_NO_CONFIG UV_CONFIG_FILE
+        export XDG_CONFIG_HOME="$isolated_uv_config"
+        export XDG_CONFIG_DIRS="$isolated_uv_config"
+        UV_PROJECT_ENVIRONMENT="$project_env" $UV_CMD sync --extra all --locked
+    )
+    sync_rc=$?
+    rmdir "$isolated_uv_config" 2>/dev/null || true
+    return "$sync_rc"
 }
 
 install_deps() {
@@ -1595,7 +1735,20 @@ install_deps() {
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
+        #
+        # Run the Tier-0 locked sync via run_locked_uv_sync: the global
+        # UV_NO_CONFIG export at script start (the #21269 sudo -u hygiene
+        # guard) also hides the project's own [tool.uv] policy —
+        # exclude-newer, its package exemptions, and override-dependencies —
+        # from uv. The resolver then runs under a different policy than the
+        # one uv.lock was resolved under, and --locked turns that mismatch
+        # fatal, so every fresh install fell through to the non-hash-verified
+        # PyPI tiers. The helper re-enables project config discovery for this
+        # one subprocess while keeping ambient user/system uv config hidden
+        # (redirected to an empty XDG dir), preserving the #21269 guarantee.
+        # Runtime code does the same before its locked syncs
+        # (hermes_cli/managed_uv.py).
+        if run_locked_uv_sync "$INSTALL_DIR/venv"; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
@@ -1700,7 +1853,7 @@ PY
         exit 1
     fi
 
-    if [ "$_tier_name" != "all (with RL/matrix extras)" ]; then
+    if [ "$_tier_name" != "all" ]; then
         log_warn "Note: installed via fallback tier ($_tier_name)."
         log_info "Some optional features may be missing. After resolving any"
         log_info "PyPI/network issue, re-run: $UV_CMD pip install -e '.[all]'"
@@ -2308,11 +2461,21 @@ install_node_deps() {
         # A failed npm install used to still print "✓ Node.js dependencies
         # installed", hiding the degradation from the user (#77003). Now it
         # fails the install outright instead of burying the warning (#85297).
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
+        # Capture npm output so failures are diagnosable (#87340).
+        local npm_log
+        npm_log="$(mktemp)"
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
+                >"$npm_log" 2>&1; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
+            if [ -s "$npm_log" ]; then
+                log_error "npm output:"
+                cat "$npm_log" >&2
+            fi
+            rm -f "$npm_log"
             restore_dirty_lockfiles "$INSTALL_DIR"
             return 1
         fi
+        rm -f "$npm_log"
         log_success "Node.js dependencies installed"
 
         # Install Playwright browser + system dependencies.
@@ -2414,11 +2577,21 @@ install_node_deps() {
         # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
         # Report success only on actual success, same as node-deps above
         # (#77003) — and fail the install outright (#85297).
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
+        # Capture npm output so failures are diagnosable (#87340).
+        local tui_npm_log
+        tui_npm_log="$(mktemp)"
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
+                >"$tui_npm_log" 2>&1; then
             log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
+            if [ -s "$tui_npm_log" ]; then
+                log_error "npm output:"
+                cat "$tui_npm_log" >&2
+            fi
+            rm -f "$tui_npm_log"
             restore_dirty_lockfiles "$INSTALL_DIR"
             return 1
         fi
+        rm -f "$tui_npm_log"
         log_success "TUI dependencies installed"
     fi
 
@@ -2443,7 +2616,10 @@ install_browser_use_cli() {
         log_info "Skipping Browser Use CLI install (uv unavailable)"
         return 0
     fi
-    if command -v browser-use >/dev/null 2>&1 || [ -x "$HERMES_HOME/bin/browser-use" ]; then
+    # MANAGED-FIRST: only Hermes' managed copy short-circuits. A browser-use
+    # on the user's PATH is a side install — resolution prefers the managed
+    # copy, so it must be provisioned regardless.
+    if [ -x "$HERMES_HOME/bin/browser-use" ]; then
         log_success "Browser Use CLI already installed"
         return 0
     fi
@@ -2458,6 +2634,37 @@ install_browser_use_cli() {
         log_warn "Browser Use CLI install failed — browser automation falls back to built-in tools."
         log_info "Install later with: $UV_CMD tool install browser-use  (or via 'hermes tools')"
     fi
+}
+
+cua_driver_runtime_compatible() {
+    local driver_path version_output manifest_output
+    local major minor
+    driver_path="$(command -v cua-driver 2>/dev/null)" || return 1
+    version_output="$("$driver_path" --version 2>/dev/null)" || return 1
+    if [[ ! "$version_output" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+        return 1
+    fi
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    if (( major == 0 && minor < 20 )); then
+        return 1
+    fi
+    manifest_output="$("$driver_path" manifest 2>/dev/null)" || return 1
+    local required
+    for required in \
+        '"mcp_invocation"' \
+        '"--socket"' \
+        '"--grant"' \
+        '"--permission-mode"' \
+        '"--capability-manifest"' \
+        '"--approve-capability-manifest"' \
+        '"--embedded"'; do
+        case "$manifest_output" in
+            *"$required"*) ;;
+            *) return 1 ;;
+        esac
+    done
+    return 0
 }
 
 install_computer_use_driver() {
@@ -2478,8 +2685,11 @@ install_computer_use_driver() {
             ;;
     esac
     if command -v cua-driver >/dev/null 2>&1; then
-        log_success "Computer Use driver (cua-driver) already installed"
-        return 0
+        if cua_driver_runtime_compatible; then
+            log_success "Computer Use driver (cua-driver) already installed and compatible"
+            return 0
+        fi
+        log_warn "Existing cua-driver is old or incomplete; repairing it"
     fi
     # Non-admin macOS accounts can't receive the CuaDriver.app bundle in
     # /Applications; skip cleanly instead of failing loudly (#47865 class).
@@ -3048,8 +3258,8 @@ install_desktop() {
     # failure, not a silent skip — a silent skip yields a "complete" install
     # with no app and a confusing "couldn't find a built desktop" at launch.
     # Always re-resolve Node here. Stages run in separate processes, so we can't
-    # trust an earlier check; more importantly check_node now enforces the build
-    # floor (Node >=26) and prepends the Hermes-managed Node to PATH, so
+    # trust an earlier check; more importantly check_node now enforces the
+    # supported Node lines and prepends the Hermes-managed Node to PATH, so
     # the build never runs on a too-old system Node — the cause of the opaque
     # "Build desktop app … exit code 1" failure (Vite crashes on old Node).
     check_node
@@ -3282,6 +3492,7 @@ run_stage_body() {
             check_python
             check_git
             check_node
+            check_cxx_compiler
             check_network_prerequisites
             install_system_packages
             ;;
@@ -3424,6 +3635,7 @@ main() {
     check_python
     check_git
     check_node
+    check_cxx_compiler
     check_network_prerequisites
     install_system_packages
 
