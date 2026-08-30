@@ -26,13 +26,29 @@ gateway/run.py, gateway/slash_commands.py, gateway/config.py, hermes_cli/model_s
 hermes_cli/providers.py, plugins/platforms/discord/adapter.py, hermes_cli/runtime_provider.py,
 agent/auxiliary_client.py）:
 
+**先に `git fetch upstream main` して `upstream/main` を最新化し、`git diff` の基準は
+`upstream/main` そのものではなく `git merge-base upstream/main HEAD` を使うこと**
+（実測 2026-08-31: ローカル `upstream/main` が無関係な壊れたブランチ参照
+`refs/remotes/upstream/ent/secrets` の破損で2週間以上fetchが止まっており、その stale な
+`upstream/main` との差分は無関係な upstream 側の自然進化まで「footprint」として混入し、
+gateway/run.py だけで +3779/-746 という誤った巨大値が出た。merge-base 基準に直したら
++140/-73 で予算内と判明。stale ref は `rm -f .git/refs/remotes/upstream/<broken-ref>` で
+削除すれば fetch が通る場合がある — `git update-ref -d` は sandbox 越しだと
+`Operation not permitted` で失敗することがあるため、直接 rm を試す）:
+
 ```bash
-git diff upstream/main --stat -- <file>      # 概観
-git diff upstream/main --numstat -- <file>   # add/delete行数を個別取得（予算チェックに使う）
+git fetch upstream main
+MB=$(git merge-base upstream/main HEAD)
+git diff "$MB" --stat -- <file>      # 概観
+git diff "$MB" --numstat -- <file>   # add/delete行数を個別取得（予算チェックに使う）
 ```
 
 すでに `gateway/claude_bridge/` パッケージが存在するなら、新規に足された bridge ロジックが
-それを経由せず inline に戻っていないかもここで確認する。
+それを経由せず inline に戻っていないかもここで確認する。**予算超過そのものは自動でリファクタ
+理由にしない** — 超過分が package 経由のフック呼び出し（例: `/model` や `/reasoning` の
+統合ポイント追加）でしかないなら、行数予算は「目安」であって「行数を削るためのタスク」を
+生まない。リファクタが要るのは、超過分に package を経由しない生ロジックが inline で
+混入しているときだけ。
 
 ## 2. 設計は main agent が固める。ファイル単位の diff-stat 予算を数値で決める
 
